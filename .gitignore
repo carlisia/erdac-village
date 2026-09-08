@@ -1,0 +1,29 @@
+# Secrets. Never commit these.
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Build output
+/bin/
+/dist/
+*.test
+*.out
+
+# Go
+vendor/
+
+# Local database and extension build trees, if placed inside the repo
+/.villagesql/
+/vsql-*/
+/build/
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Lavish review artifacts
+.lavish/
