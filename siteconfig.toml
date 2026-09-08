@@ -1,0 +1,111 @@
+# The only file that may name the company, its address, or its page structure.
+# Nothing here belongs in code, comments, docs, prompts, or test names.
+
+[site]
+name        = "Grokking Tech"
+url         = "https://grokkingtech.io"
+sitemap     = "https://grokkingtech.io/sitemap.xml"
+contact_url = "https://grokkingtech.io/about"
+
+[bot]
+persona = "a careful assistant for this site"
+tone    = "plain, direct, and never salesy"
+# Documentation of expected coverage. Not read by any code path.
+topics = [
+  "what this site is about",
+  "the author's writing on Go, MCP, and AI",
+  "how to get in touch",
+]
+# Company-vouched statements injected into the prompt. Keep empty until there
+# is something the pages do not already say.
+facts = []
+
+[messages]
+greeting  = "Ask me anything about this site."
+declined  = "I could not find that on this site."
+halted    = "The assistant is paused right now. Please try again later."
+restarted = "This conversation was cleared."
+error     = "Something went wrong. Please try again."
+
+[models]
+# vsql_ai provider strings. The provider half of each name is passed verbatim
+# as ai_prompt's / ai_embedding's first argument.
+chat_provider      = "anthropic"
+chat_model         = "claude-opus-5"
+embedding_provider = "google"
+embedding_model    = "gemini-embedding-001"
+
+[retrieval]
+# Measured 2026-09-07: the embedding model returns exactly 3072 elements, and
+# ai_embedding exposes no options argument, so a narrower vector cannot be
+# requested. VECTOR_MAX_DIMENSION() is also 3072, so this sits at the ceiling.
+#
+# The same number appears as MaxVectorDimensions in the config package, which
+# is the source of truth, and in the embeddings column declaration. A live-tier
+# test asserts all three still agree; nothing else links them.
+dimensions = 3072
+distance   = "cosine"
+# vsql_vector has no index. Extension-defined index types are unsupported by
+# the server, so every search is a sequential scan. Recorded, not a mistake.
+index      = "none"
+top_k      = 5
+
+# UNTUNED. This value is inherited and carries no evidence.
+#
+# In the Python original it was derived from 28 questions about a different
+# website scored by a different embedding model, and set below the lowest
+# question that had to be answered rather than above the highest that had to
+# be refused, because the two groups overlapped.
+#
+# Both of those inputs changed. Do not trust this number until a fixture set
+# for this site exists and has been reviewed. See DEFERRED.md.
+similarity_threshold = 0.25
+
+[chunking]
+split_on   = ["h2", "h3"]
+min_tokens = 100
+max_tokens = 800
+# Token counts are approximate. Go has no implementation of the tokenizer this
+# embedding model uses, so counts come from a word count divided by the factor
+# below, calibrated once against the provider's own counter and biased to
+# OVER-count. Over-counting is deliberate: gemini-embedding-001 rejects input
+# above 2048 tokens outright, so an under-count produces a refused chunk.
+tokens_per_word     = 1.4
+provider_token_cap  = 2048
+overlap_ratio       = 0.15
+
+[crawl]
+follow_redirects = true
+concurrency      = 4
+timeout_seconds  = 20
+user_agent       = "erdac-village"
+
+# Disallowed by the site's own robots.txt, though its sitemap lists them.
+# Sitemap membership is not a permission grant.
+robots_disallowed = ["/tags/*"]
+
+# Roughly a third of the sitemap is bare capitalized slugs that redirect to a
+# canonical path, sometimes as case-variant pairs. They produce near-empty
+# near-duplicate documents.
+default_exclude = ["/404", "/Untitled"]
+
+# Pages about people other than the site owner. Well-formed, on-brand, and not
+# about the subject of the site. No rule detects this.
+default_exclude_groups = ["/people/*"]
+
+# Any document whose body falls under this after chrome is stripped is dropped.
+# This is what actually removes the alias stubs.
+min_body_words = 40
+
+strip_selectors = ["nav", "header", "footer", "aside", ".graph-view", ".backlinks"]
+
+# A miss aborts the run before anything is written. This is the only defence
+# against a site that assembles its content in the browser.
+required_strings = []
+
+[admin]
+session_cookie_name = "erdac_village_admin"
+session_max_age     = 43200
+
+[chat]
+status_poll_seconds = 4
