@@ -69,6 +69,8 @@ Every route was tried against `vsql_ai 0.0.6` and `vsql_vector` at `ec2282c`:
 
 ### Search needs no write: `SVECTOR::FROM_STRING` accepts computed strings -- measured 2026-09-07
 
+The text form of a vector accepts exponent notation on input, in both the column and the string constructor, and the server emits it on output for small elements: `0.000012` reads back as `1.20000004e-05`. Measured 2026-09-08. The store writes plain decimals anyway, which are also accepted; the choice predates the measurement and is kept because it is pinned by a test and costs a few characters per element.
+
 `COSINE_DISTANCE` rejects a bare computed string, but accepts `SVECTOR::FROM_STRING(anything)`. Measured: a literal works, `CONCAT(...)` works, a user variable works, and `ai_embedding`'s output wrapped in `CONVERT` and `FROM_STRING` works.
 
 So the search path is:
@@ -81,7 +83,7 @@ SELECT id, 1 - COSINE_DISTANCE(vec, SVECTOR::FROM_STRING(@q)) AS similarity
 
 **No write occurs.** The decision to store each question's embedding on its conversation-turn row is therefore unnecessary and is open for the third time. Search can run against a read-only database user.
 
-Both statements must run on the same connection. A user variable belongs to one connection, and Go's pool hands out an arbitrary free one per call, so a search that issues these two through the pool can set the variable on one connection and read it on another, where it is NULL. Pin the connection for the pair. Whether a bound parameter would work in place of the variable, removing the need to pin anything for the vector, is unmeasured; the recorded reason the vector cannot be a function result predicts that it would not.
+Both statements must run on the same connection. A user variable belongs to one connection, and Go's pool hands out an arbitrary free one per call, so a search that issues these two through the pool can set the variable on one connection and read it on another, where it is NULL. Measured 2026-09-08: a variable set on one connection reads as NULL on another. Pin the connection for the pair. A bound parameter in place of the variable, which would remove the need to pin anything for the vector, is refused: measured the same day, `SVECTOR::FROM_STRING(?)` fails the way the recorded mechanism predicts, so the variable and the pin are both required.
 
 `SVECTOR::FROM_STRING` appears in no documentation page. The extension's own README still describes this form as failing, a limitation removed by server issue #486 in May 2026 and never documented since.
 

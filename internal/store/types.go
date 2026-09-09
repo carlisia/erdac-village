@@ -128,14 +128,13 @@ func checkAddress(url string) error {
 // safe by construction rather than by trust: every element is a float that
 // this function formats, so no caller-supplied text reaches the statement.
 //
-// Formatted without an exponent, deliberately. The shortest representation of
-// a float uses exponent notation below roughly one ten-thousandth, and a
-// normalised embedding is full of values that small and of negative ones.
-// Whether the vector type parses an exponent in a string literal has never
-// been asked of the server, and the answer is not needed: a decimal expansion
-// is accepted by any reading of the format. The cost is a longer literal for a
-// very small element, which for the magnitudes an embedding actually contains
-// is a few characters each.
+// Formatted without an exponent. The shortest representation of a float uses
+// exponent notation below roughly one ten-thousandth, and a normalised
+// embedding is full of values that small. This was chosen before the server
+// had been asked whether it parses an exponent; measured on 2026-09-08, it
+// does, in both the column and the string constructor, and it emits one on
+// the way out. The decimal form is kept because it is proven by the live tier
+// and pinned by a fast test, and the cost is a few characters per element.
 func formatVector(v []float32) string {
 	var b strings.Builder
 	b.Grow(len(v) * 13)
