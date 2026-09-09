@@ -1,14 +1,22 @@
-// Package schema holds the live-tier tests for the database schema.
+// The live-tier tests for the schema these migrations create.
+//
+// They live beside the migrations rather than in a package of their own,
+// because the package that holds the schema is the package that should prove
+// it. An earlier arrangement put them in a package named for the schema, and
+// when the SQL moved here that package was left named for something it no
+// longer contained, with no rule saying which of two live-tier homes a new
+// test belonged in.
 //
 // These require a running server and are skipped when TEST_MYSQL_DSN is unset.
-// They exist because a fake cannot prove any of what they assert: every rule
-// below is enforced by the database, not by Go, so a test that substituted the
-// database would only be asserting this file's own beliefs about MySQL.
+// A fake cannot prove any of what they assert: every rule below is enforced by
+// the database, not by Go, so a test that substituted the database would only
+// be asserting this file's own beliefs about MySQL.
 //
 // Every test name begins with Live so the check script can select them.
-package schema
+package migrations
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -18,8 +26,6 @@ import (
 	"github.com/carlisia/erdac-village/internal/config"
 	_ "github.com/go-sql-driver/mysql"
 )
-
-const migration = "../../migrations/0001_schema.sql"
 
 // scratchDSN puts the scratch database into the connection string itself.
 //
@@ -47,7 +53,7 @@ func scratchDSN(t *testing.T, dsn, name string) string {
 func scratchName(t *testing.T) string {
 	t.Helper()
 	var b strings.Builder
-	b.WriteString("village_live_")
+	b.WriteString("village_schema_")
 	for _, r := range strings.ToLower(t.Name()) {
 		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
 			b.WriteRune(r)
@@ -112,14 +118,30 @@ func open(t *testing.T) *sql.DB {
 	return db
 }
 
+// apply runs every migration's statements directly, rather than through the
+// migrator, and it takes them from the embedded set rather than from a path.
+//
+// Directly, because these tests assert that the SQL itself survives being run
+// more than once, and the migrator would decline the second run as already
+// recorded, so it would answer a different question.
+//
+// From the embedded set, because a hardcoded path names one file. The day a
+// second migration lands, a path would leave this whole tier passing against a
+// schema it is no longer testing, and passing is what a broken thing looks
+// like from outside.
 func apply(t *testing.T, db *sql.DB) {
 	t.Helper()
-	raw, err := os.ReadFile(migration)
+	all, err := All()
 	if err != nil {
-		t.Fatalf("read migration: %v", err)
+		t.Fatalf("read the embedded migrations: %v", err)
 	}
-	if _, err := db.Exec(string(raw)); err != nil {
-		t.Fatalf("apply migration: %v", err)
+	if len(all) == 0 {
+		t.Fatal("no migrations are embedded, so this tier would test an empty database")
+	}
+	for _, m := range all {
+		if _, err := db.Exec(m.SQL); err != nil {
+			t.Fatalf("apply migration %d (%s): %v", m.Version, m.Name, err)
+		}
 	}
 }
 
@@ -337,8 +359,14 @@ func TestLiveVectorColumnMatchesTheConstant(t *testing.T) {
 	}
 }
 
-// An upsert of a candidate must not disturb the live page for that address.
-// This is what lets a refresh run while the assistant keeps answering.
+// One address may hold a live page while its candidate is rewritten, which is
+// what lets a refresh run while the assistant keeps answering.
+//
+// This exercises the on-duplicate form rather than the store's method. The
+// store looks the row up and then writes instead, because this dialect cannot
+// return an identifier from an on-duplicate update. What is asserted here is
+// the database rule the store depends on either way: the two states do not
+// compete, so writing one cannot disturb the other.
 func TestLiveUpsertLeavesThePublishedPageUntouched(t *testing.T) {
 	db := open(t)
 	mustExec(t, db, `INSERT INTO documents (url, markdown, content_hash, state, fetched_at)
@@ -459,5 +487,187 @@ func TestLiveDeletingAPageRemovesItsEmbeddings(t *testing.T) {
 	}
 	if chunks != 0 || embeddings != 0 {
 		t.Errorf("after deleting the page: %d chunks and %d embeddings survived, want 0 and 0", chunks, embeddings)
+	}
+}
+
+// seedOneEmbedding stores one page, one chunk and one vector, which is the
+// least a similarity query can be run against.
+func seedOneEmbedding(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if err := insertDoc(db, "/vector", "h", "published"); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, `INSERT INTO chunks (document_id, ordinal, text, token_count)
+		SELECT id, 0, 'text', 2 FROM documents WHERE url='/vector'`)
+	vector := "[" + strings.Repeat("0.1,", config.MaxVectorDimensions-1) + "0.1]"
+	mustExec(t, db, `INSERT INTO embeddings (chunk_id, embedding)
+		SELECT id, '`+vector+`' FROM chunks`)
+}
+
+// queryVector is the text form of a vector, which is the only form anything
+// here accepts. Its contents do not matter; only that it is the right width.
+func queryVector() string {
+	return "[" + strings.Repeat("0.2,", config.MaxVectorDimensions-1) + "0.2]"
+}
+
+// A session variable belongs to the one connection it was set on. Go's
+// database/sql is a pool that hands out an arbitrary free connection per call,
+// so a search that sets the query vector in one statement and reads it in the
+// next can have the two land on different connections.
+//
+// This is the property that makes the search path unsafe on the pool, asserted
+// directly rather than by trying to provoke the pool into doing it, which
+// would be a race and would pass most of the time.
+func TestLiveSessionVariablesDoNotCrossConnections(t *testing.T) {
+	db := open(t)
+	db.SetMaxOpenConns(2)
+	ctx := context.Background()
+
+	writer, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	reader, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	if _, err := writer.ExecContext(ctx, "SET @probe = 'set on one connection'"); err != nil {
+		t.Fatal(err)
+	}
+
+	var here sql.NullString
+	if err := writer.QueryRowContext(ctx, "SELECT @probe").Scan(&here); err != nil {
+		t.Fatal(err)
+	}
+	if !here.Valid {
+		t.Fatal("the variable was not readable on the connection that set it, so this test proves nothing")
+	}
+
+	var there sql.NullString
+	if err := reader.QueryRowContext(ctx, "SELECT @probe").Scan(&there); err != nil {
+		t.Fatal(err)
+	}
+	if there.Valid {
+		t.Errorf("a session variable set on one connection read back as %q on another; "+
+			"the search path could stop needing a pinned connection", there.String)
+	}
+}
+
+// The search path, run the way it must be run: both statements on one pinned
+// connection. This is the form the architecture constraint prescribes, so it
+// is asserted rather than described.
+func TestLiveTheQueryVectorRoundTripsOnOnePinnedConnection(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	seedOneEmbedding(t, db)
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, "SET @q = ?", queryVector()); err != nil {
+		t.Fatalf("setting the query vector into a session variable failed: %v", err)
+	}
+	var similarity float64
+	err = conn.QueryRowContext(ctx,
+		`SELECT 1 - COSINE_DISTANCE(embedding, SVECTOR::FROM_STRING(@q)) FROM embeddings LIMIT 1`).
+		Scan(&similarity)
+	if err != nil {
+		t.Fatalf("the prescribed search shape failed on a pinned connection: %v", err)
+	}
+	if similarity < -1 || similarity > 1 {
+		t.Errorf("similarity came back as %v, which is outside the range a cosine distance can produce", similarity)
+	}
+}
+
+// Whether the session variable is needed at all comes down to one question
+// nobody has asked the server: does the vector constructor accept a bound
+// parameter? A bound parameter is rejected as the distance function's own
+// argument, measured, and the reason given is that the type is inferred before
+// the parameter is known. That reason predicts this fails too.
+//
+// So this test asserts the limitation, and fails when the limitation lifts.
+// Failing here is good news, not a regression: it means the search path can be
+// one pooled statement with nothing pinned, and two documents are now wrong.
+func TestLiveABoundParameterIsStillRejectedByFromString(t *testing.T) {
+	db := open(t)
+	seedOneEmbedding(t, db)
+
+	var similarity float64
+	err := db.QueryRow(
+		`SELECT 1 - COSINE_DISTANCE(embedding, SVECTOR::FROM_STRING(?)) FROM embeddings LIMIT 1`,
+		queryVector()).Scan(&similarity)
+	if err == nil {
+		t.Fatalf("a bound parameter through SVECTOR::FROM_STRING was ACCEPTED, returning %v.\n"+
+			"This is good news and this test is the notification. The query vector no longer needs a\n"+
+			"session variable, so search needs no pinned connection. Update the architecture constraint\n"+
+			"in CLAUDE.md, the search path in PORTING.md, and replace this test with one asserting the\n"+
+			"parameter form works.", similarity)
+	}
+	t.Logf("still rejected, as the recorded mechanism predicts: %v", err)
+}
+
+// No index may be a leftmost prefix of another, because the optimiser can
+// never choose it instead of the longer one, while the server still maintains
+// it on every insert and delete.
+//
+// This reads the catalogue rather than the file, so it also catches an index
+// added to a database by hand and one added by a later migration.
+//
+// A unique index is exempt. Its columns may be a prefix of a longer index and
+// it is still doing work no other index does, because it enforces a rule
+// rather than only serving a lookup.
+func TestLiveNoIndexIsRedundant(t *testing.T) {
+	db := open(t)
+	rows, err := db.Query(`
+SELECT table_name, index_name, non_unique, GROUP_CONCAT(column_name ORDER BY seq_in_index)
+  FROM information_schema.statistics
+ WHERE table_schema = DATABASE()
+ GROUP BY table_name, index_name, non_unique`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	type index struct {
+		name    string
+		unique  bool
+		columns string
+	}
+	byTable := map[string][]index{}
+	for rows.Next() {
+		var table, name, columns string
+		var nonUnique int
+		if err := rows.Scan(&table, &name, &nonUnique, &columns); err != nil {
+			t.Fatal(err)
+		}
+		byTable[table] = append(byTable[table], index{name, nonUnique == 0, columns})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(byTable) == 0 {
+		t.Fatal("no indexes were found at all, so this test checked nothing")
+	}
+
+	for table, indexes := range byTable {
+		for _, a := range indexes {
+			if a.unique {
+				continue
+			}
+			for _, b := range indexes {
+				if a.name == b.name || !strings.HasPrefix(b.columns+",", a.columns+",") {
+					continue
+				}
+				t.Errorf("%s.%s (%s) is a leftmost prefix of %s (%s), so it can never be chosen "+
+					"and is maintained on every write for nothing",
+					table, a.name, a.columns, b.name, b.columns)
+			}
+		}
 	}
 }

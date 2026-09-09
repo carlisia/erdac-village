@@ -86,6 +86,12 @@ CREATE TABLE IF NOT EXISTS documents (
 
 -- A slice of one page's text, sized for embedding. Deleting the page deletes
 -- its chunks, so the corpus cannot contain a chunk whose page is gone.
+--
+-- There is no separate index on document_id. The uniqueness rule below already
+-- indexes it as its leading column, so a lookup by page uses that index and a
+-- second one on the same column could never be chosen instead. The foreign key
+-- is satisfied by it for the same reason. A redundant index is not free: it is
+-- another tree to maintain on every insert and delete.
 CREATE TABLE IF NOT EXISTS chunks (
   id           BIGINT   NOT NULL AUTO_INCREMENT,
   document_id  BIGINT   NOT NULL,
@@ -96,7 +102,6 @@ CREATE TABLE IF NOT EXISTS chunks (
 
   PRIMARY KEY (id),
   UNIQUE KEY chunks_one_per_ordinal (document_id, ordinal),
-  KEY chunks_document_idx (document_id),
   CONSTRAINT chunks_document_fk FOREIGN KEY (document_id)
     REFERENCES documents (id) ON DELETE CASCADE
 ) ENGINE = InnoDB;
@@ -181,8 +186,16 @@ CREATE TABLE IF NOT EXISTS system_state (
 ) ENGINE = InnoDB;
 
 -- Both safe to repeat. The migration record takes its time from UTC_TIMESTAMP
--- rather than a column default, because that function is explicit about the
--- zone where CURRENT_TIMESTAMP is not.
+-- rather than a column default, for two reasons that have to hold together.
+--
+-- It is not CURRENT_TIMESTAMP, which on a DATETIME column evaluates in the
+-- session's zone and stores that wall clock verbatim, so two connections would
+-- write different values for one instant. UTC_TIMESTAMP names its zone.
+--
+-- And it is the server's clock rather than the application's, which the
+-- architecture constraints otherwise require, because this file is executed as
+-- raw statements with no parameters. There is no application value to put here.
+-- That is one of the three cases the constraint names; see CLAUDE.md.
 INSERT INTO system_state (id) VALUES (1)
   ON DUPLICATE KEY UPDATE id = id;
 
