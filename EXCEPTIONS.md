@@ -30,17 +30,17 @@ Shortcuts taken because this is a demonstration. Each entry says what was done, 
 
 **What we did.** No vector index exists, because the server does not yet support extension-defined index types.
 
-**Why acceptable here.** The corpus is roughly 60 to 70 pages, and performance is explicitly out of scope.
+**Why acceptable here.** One site of this size produces a corpus small enough that scanning all of it per question is not noticeable, and performance is explicitly out of scope.
 
 **What production requires instead.** An index. At corpus sizes beyond a few thousand chunks a sequential scan per question stops being viable.
 
-## Every question writes to the database before it can be answered
+## The fetch lock is advisory
 
-**What we did.** A question's embedding is stored on a row before the search can join against it, because a vector cannot be passed as a literal or a bound parameter.
+**What we did.** A marker in the database stops a second fetch starting while one is running, and stops a publish promoting a half-written set of pages. Nothing in the database enforces it. The three operations that write pages do not check it, so the guarantee holds only because the code that fetches takes the marker first.
 
-**Why acceptable here.** The row was already being written for the unanswered-questions report, so no extra lifecycle is introduced.
+**Why acceptable here.** One person runs one fetch at a time, through one path, and that path takes the marker. The documentation on the marker says plainly that it is advisory and that anything writing pages must take it.
 
-**What production requires instead.** Search that does not require a write, so that it can run against a read replica or under a read-only database user.
+**What production requires instead.** The check moved into the writes themselves, so that a page written without the marker is refused by the database rather than by a convention, or a lease the database validates on every write.
 
 ## Single tenant, one site, one admin
 

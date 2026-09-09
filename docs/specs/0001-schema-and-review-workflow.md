@@ -95,6 +95,8 @@ UNIQUE KEY documents_one_published_per_url (url_published)
 
 **Timestamps are microsecond `DATETIME`, written and read as UTC, and no column defaults to the current time.** `TIMESTAMP` converts on read according to the session time zone. `CURRENT_TIMESTAMP` is just as bad in the other direction: on a `DATETIME` column it evaluates in the session time zone and stores that wall clock verbatim, so two connections in different zones write different values for the same instant. Every time is therefore written explicitly by the application in UTC. Measured after the fix: two sessions nine hours apart in configured zone wrote timestamps zero hours apart.
 
+Some values are written by the server instead, and they are not exceptions to the reasoning above but consequences of it. The hazard is a function whose result depends on the session's zone; a function that names UTC does not have it, and the schema uses one. The fetch lock's start time exists only to be compared against the server's clock, so it takes that clock: writing it from the application would put one value on two clocks, and a machine running behind would read its own fresh lock as already abandoned. A migration's record of itself takes it because the application passes that file no parameters and so has no value to supply. Test fixtures take it because the instant is irrelevant to what they assert. Added after implementation; see the decision records of 2026-09-07 and 2026-09-08.
+
 **The include and exclude judgement is held against the address, not the page.** A separate table keyed by address carries it, and an address with no row there is included. This is what makes the judgement sticky rather than a rule the upsert must remember: a newly fetched candidate inherits it because it was never on a page. An earlier draft put an `included` column on the page row, which left stickiness to whatever SQL the upsert happened to use.
 
 **The applied migrations are recorded in the database.** A version table lets a migrator decide what still needs running. Each migration records itself in a form that is safe to repeat, so a database brought up by hand is not left looking empty.
@@ -154,3 +156,40 @@ Deleting addresses that vanished from the sitemap. They are reported, never remo
 Every mechanism above was measured against a running server on 2026-09-07 before this spec was written, across nine cases covering coexistence, both uniqueness rules, superseded rows, the generated columns, upsert isolation, publish atomicity, and the ordering failure. This spec describes something already proven to work, not something believed to work.
 
 The reason for the generated-column substitute, the reason there is no vector index, and the reason the query log has no embedding column are each recorded in the porting notes with what was lost and why. A reader who wants to know what this schema would have looked like on Postgres should read that file rather than inferring it from here.
+
+## Added after this specification
+
+Everything below was built during implementation and is not asked for above. It is recorded here so the specification stays the reference for what the code does, rather than a description of an earlier version of it. Each entry says what was added and what asked for it.
+
+**Thirteen sentinel errors, where this specification names six.** The list is given in full rather than counted, because a count is a number that drifts out of step with the thing it counts and nothing notices.
+
+Named here: a fetch already running, a halted assistant, a publish attempted during a fetch, the two duplicate-key violations, and an address longer than the column. Added during implementation, each with its reason:
+
+- **A deadlock or a lock-wait timeout.** These are the two failures where retrying is correct, and every other failure means the opposite. A caller that cannot tell them apart either retries nothing or retries everything.
+- **An abandoned fetch.** Described below; it carries behaviour this specification does not ask for.
+- **A release refused because the lock is no longer this run's.** A run that overran the expiry has had its lock taken by another fetch. Clearing it then would release a lock a live run is relying on, so the release is refused. No story asks for this; it follows from the expiry existing at all.
+- **The system-state row missing.** The migration seeds one row, so its absence means the database was not brought up properly, and that has a different remedy from any driver failure.
+- **An embedding of the wrong width.** The column is declared at one width and the embedding function offers no way to ask for another, so a different width is a fault in the caller rather than a configuration choice.
+- **The vector extension absent**, and **a server whose widest vector is narrower than an embedding.** Both are refusals to migrate at all, described next.
+
+**A check that the vector extension is present, run before any migration.** The schema declares a vector column and migrations cannot roll back, so applying without the extension leaves the earlier tables created and reports an unrecognised type. The migration file already said the migrator would check first; nothing in this specification said so.
+
+**Connection pool limits.** Go opens an unlimited number of connections by default and keeps each forever. The model functions hold a server thread for a whole outbound call, so an unbounded pool exhausts the server's connection limit rather than making callers wait, and a connection kept past the server's idle timeout fails on a handle that looks fine.
+
+**Publish is refused after an abandoned fetch, not only during a live one.** Story 15 refuses a publish while a fetch runs and story 14 expires a stale lock, and the two together left a hole neither names. After a crash mid-crawl the lock expires, so the next publish saw no lock and promoted whatever the dead run had written, which is half of one crawl and violates story 5 silently. Expiring the lock and trusting the pages written under it are two different decisions; only the first is asked for here. A lock that is present but expired now refuses a publish and permits a new fetch, so a crashed run still cannot lock the system out. The recovery is a fetch that runs to completion, which replaces those candidates and releases the lock.
+
+**The publish transaction states its isolation level.** This specification fixes the ordering inside publish and leaves the isolation level to the server. Locking the candidate set is what keeps a candidate written mid-publish from being silently left behind, and that only holds where a range lock also blocks an insert into the range it covers. Under the weaker level many servers are configured with, the same statement takes no such lock and the publish reports success having missed the new candidate. The level is now requested rather than inherited, and a live test asserts the transaction actually gets it.
+
+**Two check constraints beyond the one specified.** This specification asks for a check constraint enforcing the single system-state row. The schema also constrains a page's state and a logged question's outcome to their known values, so a typo in a future statement is refused by the database rather than stored as a state nothing matches.
+
+**No separate index on a chunk's page.** The uniqueness rule on a page and an ordinal already indexes the page as its leading column, so a second index on that column alone could never be chosen and would be maintained on every write for nothing. A live test now refuses any non-unique index that is a leftmost prefix of another.
+
+**Some values are written by the server's clock**, described in the timestamp paragraph above.
+
+## Not built, and where that is recorded
+
+The query log has no writer. Nothing in Go writes a row to it, which is consistent with the retrieval path being a later specification, and the stories covering unanswered questions are unserved by this work.
+
+No consumer declares an interface over the store, because no consumer exists yet. The in-memory double the testing section describes is recorded in `DEFERRED.md` rather than written against interfaces nobody has declared.
+
+Addresses that vanish from the sitemap are reported rather than deleted only in the sense that nothing deletes them. No code compares a sitemap to the stored addresses, because nothing fetches a sitemap yet.

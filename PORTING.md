@@ -46,7 +46,7 @@ Prompt assembly stays in Go; only the model call goes into SQL. Full-SQL retriev
 
 ### No index -- forced, unmeasured
 
-Erdac uses an HNSW index over pgvector with `SET LOCAL hnsw.ef_search = 100`. `vsql_vector` has no index at all: extension-defined index types are not yet supported by the server, so every search is a sequential scan. Performance is explicitly out of scope here, and the corpus is roughly 60 to 70 pages. See CONTRIBUTIONS: custom index types.
+Erdac uses an HNSW index over pgvector with `SET LOCAL hnsw.ef_search = 100`. `vsql_vector` has no index at all: extension-defined index types are not yet supported by the server, so every search is a sequential scan. Performance is explicitly out of scope here, and one site produces a corpus small enough that scanning all of it per question is not noticeable. See CONTRIBUTIONS: custom index types.
 
 ### The two extensions do not compose: an embedding cannot be stored from SQL -- forced, measured 2026-09-07
 
@@ -81,6 +81,8 @@ SELECT id, 1 - COSINE_DISTANCE(vec, SVECTOR::FROM_STRING(@q)) AS similarity
 
 **No write occurs.** The decision to store each question's embedding on its conversation-turn row is therefore unnecessary and is open for the third time. Search can run against a read-only database user.
 
+Both statements must run on the same connection. A user variable belongs to one connection, and Go's pool hands out an arbitrary free one per call, so a search that issues these two through the pool can set the variable on one connection and read it on another, where it is NULL. Pin the connection for the pair. Whether a bound parameter would work in place of the variable, removing the need to pin anything for the vector, is unmeasured; the recorded reason the vector cannot be a function result predicts that it would not.
+
 `SVECTOR::FROM_STRING` appears in no documentation page. The extension's own README still describes this form as failing, a limitation removed by server issue #486 in May 2026 and never documented since.
 
 The distinction that matters, and that cost this port two reversals: inference of a parameterized type runs at `fix_fields` time, so it succeeds for literals and user variables and fails for a function result. Search works because the embedding can be put in a user variable first. Storage fails because the column assignment has no inferred dimension to check against.
@@ -109,7 +111,7 @@ Erdac read its key from an environment variable in the application process and n
 
 ### Embeddings are generated one row at a time -- forced
 
-Erdac batches 64 texts per HTTP request. `ai_embedding` issues one request per row, serially, holding a server thread for up to 30 seconds per call on a cloud provider. Against a corpus of 60 to 70 pages this is many hundreds of sequential round trips. Performance is out of scope, but `SET SESSION max_execution_time` has to accommodate it. See CONTRIBUTIONS: batched embedding.
+Erdac batches 64 texts per HTTP request. `ai_embedding` issues one request per row, serially, holding a server thread for up to 30 seconds per call on a cloud provider. One round trip per chunk, and a page yields several chunks, so a full ingest is a long sequence of them. Performance is out of scope, but `SET SESSION max_execution_time` has to accommodate it. See CONTRIBUTIONS: batched embedding.
 
 ## Schema
 
@@ -160,6 +162,16 @@ The column becomes `VARCHAR(768)`, 768 being the largest utf8mb4 length that fit
 Four `RETURNING` sites become `LAST_INSERT_ID()` after an insert, or a `SELECT` after an update inside the same transaction. The latter is safe only because those two updates target a single-row table inside a transaction; the same rewrite applied to a multi-row update would be a race.
 
 `DISTINCT ON (url)` becomes `ROW_NUMBER() OVER (PARTITION BY url ...)` filtered to 1. `ANY(%s)` becomes generated placeholders in an `IN` list.
+
+### Chunk identifiers cost one round trip each -- forced, unmeasured
+
+Erdac inserts all of a page's chunks in one statement and reads their identifiers back from `RETURNING id`. It needs those identifiers because the vector for a chunk is stored against the chunk's row.
+
+MySQL has no `RETURNING`, and the substitute for it does not survive a multi-row insert. `LAST_INSERT_ID()` reports the identifier of the first row of a batch, and consecutive identifiers for the rest of the batch are only guaranteed under one of the server's three automatic-identifier allocation modes. The default is not that one. So a batched insert would return identifiers that are correct on many servers and silently wrong on others, and wrong identifiers here attach a page's vectors to another page's chunks.
+
+Chunks are therefore inserted one at a time, each reporting its own identifier. The cost is one round trip per chunk instead of one per page, paid on every fetch of every changed page.
+
+Marked unmeasured: this rests on the server's documented behaviour for its allocation modes, not on an observed failure. Measuring it means setting the interleaved mode and showing a batch return a non-consecutive identifier.
 
 ## Tooling and tests
 

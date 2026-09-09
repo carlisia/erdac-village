@@ -44,7 +44,7 @@ Terms used across this repository where two readers could reasonably disagree on
 
 **Declined.** The visitor was told the pages do not cover their question. Four different situations produce it: nothing was retrieved, nothing scored above the cutoff, the model was called and said the extracts did not answer, or an error occurred. The reason code distinguishes them.
 
-**Sentinel.** The exact string the model is instructed to reply with when the extracts do not answer the question. Only the opening of the reply counts, so a refusal followed by an apology still refuses, and an answer that merely quotes the string later still answers. The sentinel text never reaches the visitor.
+**Sentinel.** The exact string the model is instructed to reply with when the extracts do not answer the question. Unrelated to a sentinel error, defined below. Only the opening of the reply counts, so a refusal followed by an apology still refuses, and an answer that merely quotes the string later still answers. The sentinel text never reaches the visitor.
 
 **Trace identifier.** A handle written on a log row that also appears in the monitoring system, so one question can be followed from the administrator's table into the trace of what actually happened. It exists whether or not monitoring is switched on, so the row always has a handle.
 
@@ -58,6 +58,8 @@ Terms used across this repository where two readers could reasonably disagree on
 
 ## The port
 
+**Sentinel error.** A named failure that code returns instead of a message, so that a caller can test which failure happened rather than reading the words. Each one stands for a situation with its own remedy: a fetch already running, an address too long, a database refusing a caller to break a deadlock. Unrelated to the sentinel the model replies with, defined above; the two share a word because both are a fixed value standing for a known case.
+
 **Seam.** A point where a test can substitute the outside world. This system has two: where pages come from, and where results go.
 
 Each has one concrete implementation and no wide interface. Consumers declare the two to four methods they call, next to the code that calls them, and one test double satisfies all of those declarations. "The Store seam" therefore names a boundary, not a single type.
@@ -68,7 +70,9 @@ Each has one concrete implementation and no wide interface. Consumers declare th
 
 **Forced / chosen.** The label on every `PORTING.md` entry. Forced means the stack left no option. Chosen means it did, and the entry gives the reason.
 
-**Researched / measured.** The confidence label on `PORTING.md` and `CONTRIBUTIONS.md` entries. Researched means it comes from reading documentation or source. Measured means it was observed against a running server. Nothing is filed upstream while still researched.
+**Measured / unmeasured (porting).** The confidence label on every `PORTING.md` entry. Measured means it was observed against a running server, and the label carries the date. Unmeasured means it was not, so it rests on reading rather than on observation.
+
+**Researched / measured (contributions).** The confidence label on every `CONTRIBUTIONS.md` entry. Researched means someone read the documentation and source of the project the entry is aimed at. Measured means it was also observed against a running server. Nothing is filed upstream while still researched.
 
 ## VillageSQL
 
