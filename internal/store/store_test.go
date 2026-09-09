@@ -569,6 +569,15 @@ func TestEveryLiveTestIsNamedSoTheCheckScriptFindsIt(t *testing.T) {
 				t.Errorf("%s: %s does not begin with TestLive, so the check script's pattern skips it",
 					rel, m[1])
 			}
+			// Each live test creates a scratch database named after itself, and
+			// MySQL caps a database name at 64 characters. The live tier refuses
+			// to truncate, so an overlong name fails there, which is the tier
+			// that runs least. Three names were over the cap for a day before
+			// anyone ran it. The longest prefix any tier uses is the budget.
+			if n := len(scratchPrefixLongest) + len(scratchSafe(m[1])); n > 64 {
+				t.Errorf("%s: %s would make a %d-character scratch database name; MySQL allows 64",
+					rel, m[1], n)
+			}
 		}
 		return nil
 	})
@@ -578,6 +587,23 @@ func TestEveryLiveTestIsNamedSoTheCheckScriptFindsIt(t *testing.T) {
 	if files == 0 {
 		t.Fatal("no live-tier files were found, so this guard checked nothing")
 	}
+}
+
+// scratchPrefixLongest is the longer of the two prefixes the live tiers put on
+// a scratch database name. Using it for every file is one character stricter
+// than necessary for the store's tier, which is a fair price for one rule.
+const scratchPrefixLongest = "village_schema_"
+
+// scratchSafe mirrors what the live tiers do to a test name: lower it and keep
+// only what a database name may contain.
+func scratchSafe(name string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(name) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // moduleRoot walks up from the test's own directory to the directory holding

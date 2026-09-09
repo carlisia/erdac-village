@@ -58,7 +58,7 @@ fi
 step "tests (fast)" go test -short -count=1 ./...
 
 if [ -n "${TEST_MYSQL_DSN:-}" ]; then
-  live=$(go test -run Live -count=1 -json ./... 2>&1)
+  live=$(go test -run '^TestLive' -count=1 -json ./... 2>&1)
   status=$?
   passed=$(printf '%s\n' "$live" | grep -c '"Action":"pass","Package":"[^"]*","Test":')
   if [ "$status" -ne 0 ]; then

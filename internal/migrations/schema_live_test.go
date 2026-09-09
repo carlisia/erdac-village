@@ -559,7 +559,7 @@ func TestLiveSessionVariablesDoNotCrossConnections(t *testing.T) {
 // The search path, run the way it must be run: both statements on one pinned
 // connection. This is the form the architecture constraint prescribes, so it
 // is asserted rather than described.
-func TestLiveTheQueryVectorRoundTripsOnOnePinnedConnection(t *testing.T) {
+func TestLiveQueryVectorOnAPinnedConnection(t *testing.T) {
 	db := open(t)
 	ctx := context.Background()
 	seedOneEmbedding(t, db)
@@ -594,7 +594,7 @@ func TestLiveTheQueryVectorRoundTripsOnOnePinnedConnection(t *testing.T) {
 // So this test asserts the limitation, and fails when the limitation lifts.
 // Failing here is good news, not a regression: it means the search path can be
 // one pooled statement with nothing pinned, and two documents are now wrong.
-func TestLiveABoundParameterIsStillRejectedByFromString(t *testing.T) {
+func TestLiveFromStringStillRejectsABoundParam(t *testing.T) {
 	db := open(t)
 	seedOneEmbedding(t, db)
 
