@@ -5,7 +5,13 @@
 name        = "Grokking Tech"
 url         = "https://grokkingtech.io"
 sitemap     = "https://grokkingtech.io/sitemap.xml"
-contact_url = "https://grokkingtech.io/about"
+# The home page carries the contact details in its served text, which the
+# survey of 2026-09-08 confirmed. The earlier value named a folder listing
+# whose article arrives empty, so the body-length floor dropped it and the
+# topic about getting in touch had no source. The fragment is never sent to
+# the server, so the crawler fetches the home page; it only steers a visitor
+# who follows the link.
+contact_url = "https://grokkingtech.io/#contact"
 
 [bot]
 persona = "a careful assistant for this site"
@@ -84,9 +90,13 @@ user_agent       = "erdac-village"
 # Sitemap membership is not a permission grant.
 robots_disallowed = ["/tags/*"]
 
-# Roughly a third of the sitemap is bare capitalized slugs that redirect to a
-# canonical path, sometimes as case-variant pairs. They produce near-empty
-# near-duplicate documents.
+# Two addresses excluded by name. Surveyed 2026-09-08: the alias stubs on this
+# site do not redirect (they return 200 with a meta refresh) and about half
+# carry no capital letter, so neither redirects nor capitalisation identifies
+# them. Every stub has exactly one path segment and every real page has more,
+# and the decision of 2026-09-08 skips single-segment addresses by shape
+# before fetching. Both entries here are single-segment, so that rule covers
+# them; the fetching specification decides whether this list stays.
 default_exclude = ["/404", "/Untitled"]
 
 # Pages about people other than the site owner. Well-formed, on-brand, and not
@@ -94,7 +104,9 @@ default_exclude = ["/404", "/Untitled"]
 default_exclude_groups = ["/people/*"]
 
 # Any document whose body falls under this after chrome is stripped is dropped.
-# This is what actually removes the alias stubs.
+# Surveyed 2026-09-08: folder listing pages arrive with an empty article and
+# only links, so this is what removes them. The alias stubs are skipped by
+# shape before fetching and never reach this floor.
 min_body_words = 40
 
 strip_selectors = ["nav", "header", "footer", "aside", ".graph-view", ".backlinks"]
