@@ -15,6 +15,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -237,7 +238,7 @@ func TestLiveExclusionSurvivesARefetch(t *testing.T) {
 
 // Excluding an address takes effect at once rather than at the next publish,
 // so a page already live stops being part of the corpus immediately.
-func TestLiveExcludingAPublishedAddressTakesEffectAtOnce(t *testing.T) {
+func TestLiveExcludingALivePageIsImmediate(t *testing.T) {
 	db := openLive(t)
 	ctx := context.Background()
 
@@ -583,22 +584,32 @@ func TestLiveARealisticVectorRoundTrips(t *testing.T) {
 		t.Fatalf("a vector with negative and very small elements was refused: %v", err)
 	}
 
-	// The column arrives as the text form under both protocols, measured.
+	// The column arrives as the text form under both protocols, measured. The
+	// server spells the elements its own way on the way out: the first live run
+	// showed 0.000012 coming back as 1.20000004e-05, the same float32 value
+	// written as the server prefers. So the comparison is numeric, element by
+	// element, at float32 precision. Comparing the spelling asserted something
+	// the round trip never promised.
 	var raw []byte
 	if err := db.db.QueryRowContext(ctx,
 		`SELECT embedding FROM embeddings WHERE chunk_id = ?`, ids[0]).Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
-	read := string(raw)
+	read := strings.TrimSpace(string(raw))
 	if !strings.HasPrefix(read, "[") || !strings.HasSuffix(read, "]") {
 		t.Fatalf("the column did not read back as a bracketed vector: %.80s", read)
 	}
-	if n := strings.Count(read, ",") + 1; n != config.MaxVectorDimensions {
-		t.Errorf("the column read back with %d elements, want %d", n, config.MaxVectorDimensions)
+	fields := strings.Split(strings.Trim(read, "[]"), ",")
+	if len(fields) != len(want) {
+		t.Fatalf("the column read back with %d elements, want %d", len(fields), len(want))
 	}
-	for _, sample := range []string{"-0.1", "0.000012", "-0.0000034"} {
-		if !strings.Contains(read, sample) {
-			t.Errorf("%q did not survive the round trip; stored: %.120s", sample, read)
+	for i, f := range fields {
+		got, err := strconv.ParseFloat(strings.TrimSpace(f), 32)
+		if err != nil {
+			t.Fatalf("element %d read back as %q, which is not a number: %v", i, f, err)
+		}
+		if float32(got) != want[i] {
+			t.Errorf("element %d: wrote %v, read back %v", i, want[i], float32(got))
 		}
 	}
 }
