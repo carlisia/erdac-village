@@ -1,0 +1,47 @@
+# Lint configuration.
+#
+# errcheck is on and stays on. The exclusions below are the calls where Go's
+# own idiom is to discard the error, and every one of them was read before
+# being listed rather than added to silence a run.
+#
+# The reason for excluding them is not that sixteen findings are tedious. It is
+# that sixteen correct-as-written findings train a reader to skim the output,
+# and the finding that matters is the seventeenth. A lint run nobody reads
+# catches nothing.
+#
+# Anything not listed here must be handled or must carry a comment saying why
+# it is discarded.
+version: "2"
+
+linters:
+  settings:
+    errcheck:
+      exclude-functions:
+        # Rollback after a successful commit returns a sentinel by design, so
+        # the deferred call in every transaction reports an error on the happy
+        # path. Checking it would mean checking for the one value that means
+        # nothing went wrong.
+        - (*github.com/jmoiron/sqlx.Tx).Rollback
+        - (*database/sql.Tx).Rollback
+        # A rows error is already reported by rows.Err, which every loop here
+        # checks. Closing reports the same failure a second time.
+        - (*database/sql.Rows).Close
+        - (*github.com/jmoiron/sqlx.Rows).Close
+        # A pinned connection returned to the pool. CLAUDE.md's architecture
+        # constraints require the search path to hold one of these and release
+        # it with a deferred close, so the mandated shape would otherwise be a
+        # finding on every use. Releasing a connection cannot fail in a way the
+        # caller can act on: the pool discards a bad one either way.
+        - (*database/sql.Conn).Close
+        - (*github.com/jmoiron/sqlx.Conn).Close
+
+  exclusions:
+    rules:
+      # Closing a handle in a test's cleanup. The test has already reached its
+      # verdict by then, so a close failure cannot change it and reporting one
+      # would attach an unrelated result to a finished test. In production code
+      # a close error is meaningful and is still checked, which is why this is
+      # scoped to test files rather than added to the function list above.
+      - path: _test\.go
+        linters: [errcheck]
+        source: \.Close\(\)
