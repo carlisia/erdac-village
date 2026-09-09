@@ -36,6 +36,10 @@ Company name, brand, domain, page structure, page counts: `siteconfig.toml` only
 
 Site-specific observations get generalized into hazards before they enter a document. Concrete cases stay as unnamed illustrations.
 
+One exemption, and it is narrow. A survey record may state the **structural shape** of the crawl target where that shape is what a defence is built from: how many path segments an address has, what kind of page a group of addresses holds, what chrome every page carries. A checklist that cannot record its own answers is half a checklist, and the next specification would re-derive them by hand.
+
+The exemption covers shape only. It permits no address, no company name, no brand, no domain, and no count. Proportions were always allowed and still are. A survey finding that can be written as a shape must be written that way, and one that can only be written as an address does not go in the document at all.
+
 ## PORTING.md
 
 The record of where this system and Erdac diverge. Append the moment a divergence is found, never batch.
@@ -48,7 +52,7 @@ Mark an entry _unmeasured_ while it rests on research rather than on a running s
 
 Gaps in VillageSQL that would be worth fixing upstream. Aimed outward, at that project, not at this one.
 
-Every entry names the repository, states the gap, and argues why it affects more people than this port. Same _researched_ / _measured_ marking as `PORTING.md`. **Never file anything upstream while still marked researched.**
+Every entry names the repository, states the gap, and argues why it affects more people than this port. Mark an entry _researched_ until it is confirmed against a running server, then _measured_ with the date. The word for the unconfirmed state differs from `PORTING.md`'s _unmeasured_ deliberately: an entry aimed at another project asserts its author read that project's documentation and source, which is a stronger claim than not having measured. **Never file anything upstream while still marked researched.**
 
 ## DECISIONS.md
 
@@ -116,6 +120,7 @@ Timestamps: `TZ='America/Los_Angeles' date '+%Y-%m-%d %H:%M %Z'`
 - `ai_embedding` returns a binary-charset string. Wrap every call in `CONVERT(... USING utf8mb4)` or `SVECTOR` assignment fails with a misleading `Incorrect SVECTOR value`.
 - Without `FROM_STRING`, `COSINE_DISTANCE` accepts its query vector only as a **true constant** or a **custom-type column**. A bound parameter, a user variable, and `CONCAT(...)` all fail with `argument 2 must be a custom type or string constant`. A function result is not a constant, so `COSINE_DISTANCE(col, ai_embedding(...))` cannot work.
 - A question's embedding therefore goes into a session variable, through `SVECTOR::FROM_STRING`, and inline to `COSINE_DISTANCE`. **Search performs no write** and can run under a read-only account. Storing it on a row was the design through two earlier revisions and is no longer needed.
+- **A session variable belongs to one connection, and `database/sql` is a pool.** It hands out an arbitrary free connection per call, so `SET @v` and the statement reading `@v` can land on different connections and the read returns NULL. This applies to the query vector and to the API key alike, and it is intermittent: it only fires once more than one connection is free, so it passes in development and fails under load. Pin one connection with `Connx` and `defer conn.Close()` for the whole sequence. Prefer that over a transaction, because search performs no write and must stay runnable under a read-only account. The same hazard is why `store.Open` sets the session time zone as a connection-string parameter rather than with `SET`. Pinned by a live test.
 - Selecting an `SVECTOR` column into Go is safe. It arrives as `[]byte` holding the text form, under both the binary and text protocols. Measured, not assumed.
 - The bundled `villagesql` wrapper starts `mysqld` with `--no-defaults`, so `SET PERSIST` never survives a restart. Pass server flags at start: `villagesql --dir <dir> start -- --vsql_allow_preview_extensions=ON`.
 - `veb_dir` depends on how the server was started. A wrapper-managed instance reads `<instance>/veb/` and begins with no extensions at all; the bundled ones must be copied in.
@@ -125,9 +130,10 @@ Timestamps: `TZ='America/Los_Angeles' date '+%Y-%m-%d %H:%M %Z'`
 - `ai_prompt` and `ai_embedding` hold a server thread for the whole outbound HTTP call, one request per row, serially. Set `SET SESSION max_execution_time` accordingly.
 - **Both return NULL plus `Warning 3200` on failure. They do not raise.** Check for NULL on every call. A half-failed embedding run writes NULLs and reports success.
 - `ai_prompt` takes one flat prompt string. No system role, no messages array, no streaming, no token usage, no model fallback.
-- API keys are plain function arguments, visible in query logs, slow query logs, and process lists. Hold them in a session variable, never inline in the statement.
+- API keys are plain function arguments, visible in query logs, slow query logs, and process lists. Hold them in a session variable, never inline in the statement, on the same pinned connection as the statement that reads them.
 - An administrator's include/exclude judgement lives against the **address**, not the page, so a new candidate inherits it with nothing to carry forward.
-- No column defaults to `CURRENT_TIMESTAMP`: for a `DATETIME` it evaluates in the session time zone. Write every time explicitly in UTC.
+- **Never a time function whose result depends on the session zone.** `CURRENT_TIMESTAMP` on a `DATETIME` evaluates in the session's zone and stores that wall clock verbatim, so two connections write different values for one instant. No column defaults to it. `UTC_TIMESTAMP` names its zone and is not that hazard.
+- **Times the application has are written by the application, in UTC**, so that values compared against each other come from one clock. Three kinds of value take the server's clock instead, each because there is no application value to use, and each is a `UTC_TIMESTAMP(6)` written into the statement rather than a column default: a value that exists only to be compared against the server's own clock, which is the fetch lock's start time; a value written by a SQL file the application passes no parameters to, which is a migration's record of itself; and a fixture in a live test, where the instant is irrelevant to what is being asserted. Anything outside those three is a bug, not a fourth case.
 - `information_schema.COLUMN_TYPE` reports `SVECTOR` without its width. Use `SHOW CREATE TABLE` when verifying the declared dimension; the width is enforced, just not introspectable that way.
 - **DDL is not transactional.** `ROLLBACK` does not undo a `CREATE TABLE`. Migrations get idempotence instead of atomicity: declare each table with its indexes, constraints and generated columns inline in one create-if-absent statement.
 - MySQL cannot index a `TEXT` column without a key length. URL columns are `VARCHAR(768)`, the utf8mb4 index limit.
@@ -135,14 +141,16 @@ Timestamps: `TZ='America/Los_Angeles' date '+%Y-%m-%d %H:%M %Z'`
 
 ## Ingest hazards
 
-Each produces a knowledge base that looks healthy and answers confidently while wrong. None are self-announcing. Check before first publish; `PLAN.md` has the full list and the site survey checklist.
+Each produces a knowledge base that looks healthy and answers confidently while wrong. None are self-announcing. This is the list. `PLAN.md` has the site survey: the read-only checklist that tests for each one against the real site, and the record of what the current target answered. Run it before first publish and after any change to the site's shape.
 
 1. **Client-side rendered content.** Site builders assemble FAQ blocks, carousels, and dynamic lists in the browser. A downloader gets empty containers inside a normal-looking page. Assert `required_strings` from `siteconfig.toml` and fail the run on a miss.
 2. **Pages about other people or businesses.** Guest posts, customer stories, profiles of researchers the site owner writes about. Well-formed, on-brand, and not about the site owner. No rule detects this; exclude by URL group during review.
 3. **A single unrepresentative price.** Most marketing sites publish exactly one figure. Every cost question retrieves it. Grep the downloaded text for currency symbols before publishing.
 4. **Sections hidden from readers but present in HTML.** Conditional and unpublished blocks carry a hiding class and keep their text. Strip them or the bot quotes invisible content.
 5. **Nav, footer, and sidebar repeated site-wide.** Unstripped, they enter every chunk and make unrelated pages score high. A digital garden adds a backlinks and graph-view block to this.
-6. **Alias stubs.** Bare capitalized slugs that redirect to a canonical path, sometimes as case-variant pairs. They inflate the crawl and produce near-empty near-duplicate documents. Resolve redirects, canonicalize case, drop anything under a body-text floor.
+6. **Alias stubs.** Addresses whose only purpose is to point at the real page. They inflate the crawl and produce near-empty near-duplicate documents. Do not expect a redirect: a stub can return success carrying only a refresh instruction, in which case following redirects removes none of them. Do not expect capitalisation to mark them. Identify them by shape and by an instruction not to index, check whether their targets are already listed separately, and drop anything under a body-text floor.
 7. **A sitemap that lists robots-disallowed paths.** Sitemap membership is not a permission grant. Filter the frontier against robots.txt explicitly.
 8. **Unlinked services.** A login area on an address the public site never links. Describe from published copy if asked; never publish the address.
 9. **Required topics with no source.** Check page text, not URLs. Content often lives in a page whose address says nothing about it.
+10. **A sitemap that is not clean input.** Entries can be relative strings rather than addresses, can repeat, and can carry characters needing escaping. Measured: a relative entry containing a colon parses without error, the text before the colon becomes a scheme, and resolving it against the site base returns the string unchanged. Validate every entry and reject a malformed one loudly.
+11. **Body text extracted by pattern rather than by parser.** A `>` inside an attribute value ends a naive tag match early, so attribute contents including script source leak into the extracted text and are then embedded and retrieved. Extract with a real HTML parser, never with a pattern.
