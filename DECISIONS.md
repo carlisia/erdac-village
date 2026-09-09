@@ -26,7 +26,7 @@ The decisions came in seven rounds of a structured interview. Round timestamps a
 
 **Why:** It is what makes "nothing goes live until an admin reviews it" work while the bot keeps answering from the previous version. Postgres enforces it with partial unique indexes, which MySQL does not have, so this is the case that most tests the instruction to mirror all features.
 
-**Alternatives rejected:** One row per address, which would mean a page under review stops answering. Rejected because it is a regression that was already found and fixed once in Erdac, where a refresh took the live site from 68 pages to 55. Dropping review entirely was also rejected, as it is the product's main safety property.
+**Alternatives rejected:** One row per address, which would mean a page under review stops answering. Rejected because it is a regression that was already found and fixed once in Erdac, where a refresh took roughly a fifth of the live site offline. Dropping review entirely was also rejected, as it is the product's main safety property.
 
 **Recorded by:** grill-with-docs
 
@@ -899,3 +899,89 @@ Swapping the values is the mutation that means something, and both orderings of 
 **Alternatives rejected:** Separate helpers named for each case, such as one for no lock and one for a held lock. Two arguments that read as the row they produce keep the call sites honest about what is being stubbed, and the cases differ only in those two values.
 
 **Recorded by:** code-review
+
+## 2026-09-08 18:41 PDT - The first live run: three names too long, and a guard that counted the wrong test
+
+**Decision:** Shorten three live-test names. Move the scratch-database name-length check into the fast tier. Anchor the check script's live pattern so that only tests beginning with the live prefix count as having run.
+
+**Why:** The live tier ran for the first time and could not reach the server, because the connection string named the wrong user. That is a configuration matter. But three tests failed before reaching the server at all, on a check written into the live tier itself: each live test creates a scratch database named after itself, MySQL caps that name at 64 characters, and the check refuses to truncate. Three names were over the cap. The check was correct and it lived in the one tier that never runs, so it caught nothing for a day.
+
+The same run exposed a second fault. The check script selects live tests with a pattern that matched anywhere in a name, and a fast-tier test named for guarding the live tier contains the word. It matched, it passed, and its pass alone satisfied the script's rule that at least one live test must have run. With every real live test deleted the script would still have reported the tier green, on the strength of a test that never touches a database. The pattern is now anchored to the start of the name.
+
+**Alternatives rejected:** Truncating scratch names to fit, which two tests sharing one database would turn into results that depend on running order. Renaming the guard test to avoid the word, which fixes one collision and leaves the pattern open to the next.
+
+**Recorded by:** none
+
+## 2026-09-08 18:48 PDT - Stubs are skipped by shape, before fetching
+
+**Decision:** The crawler does not fetch any sitemap address with a single path segment. Chosen from three options presented for review.
+
+**Why:** The survey measured that every alias stub on this site has exactly one path segment and every real page has more, that the capitalisation rule in the configuration catches three stubs in eleven, and that every stub's real target is listed in the sitemap separately. Skipping by shape is therefore exact on this site and loses no page, and it costs nothing, where fetching every stub and dropping it afterwards is dozens of wasted downloads per crawl that only works because stubs happen to be empty.
+
+The two addresses the configuration excludes by name are both single-segment, so this rule makes that list redundant. The specification covering fetching decides whether the list stays as documentation or goes.
+
+**Alternatives rejected:** Fetching everything and relying on the body-length floor. Keeping the capitalisation rule, which is measured to miss most of them.
+
+**Recorded by:** none (options presented via lavish)
+
+## 2026-09-08 18:48 PDT - A malformed sitemap entry is skipped and named, not repaired and not fatal
+
+**Decision:** When a sitemap entry is not an absolute address, the crawler skips it and the run's summary lists it by its exact text. The crawl continues. Chosen from three options.
+
+**Why:** Two entries in this sitemap are bare strings containing a colon, which a URL parser accepts without error by reading the text before the colon as a scheme. Silently skipping them is what happens today, and nothing says so. Refusing the whole crawl for a typo in a file the site tool generates holds every other page hostage to it. Guessing a repair fetches a page that may not be the one intended and reports nothing about having guessed.
+
+**Alternatives rejected:** Refusing the crawl. Resolving the entry against the site base.
+
+**Recorded by:** none (options presented via lavish)
+
+## 2026-09-08 18:48 PDT - The contact address points at the home page
+
+**Decision:** `contact_url` names the home page with a fragment for its contact section. Chosen from four options, with the address supplied by the user.
+
+**Why:** The previous value named a folder listing whose article element arrives empty, so the body-length floor dropped it and the topic about getting in touch had no source page. The home page's served text carries the contact details, confirmed against the copy fetched during the survey, and at well over the floor it is stored and searched like any other page. A fragment is never sent to the server, so the crawler fetches the home page and the fragment only steers a visitor who follows the link.
+
+One thing is unverified: the served HTML did not contain an element with that fragment's identifier, so the link may land at the top of the page rather than at the section. That affects where a visitor lands, not whether the chatbot can answer.
+
+**Alternatives rejected:** Writing the contact details into the facts list, which is a second place to keep current. Dropping the topic. Exempting the listing page from the floor, which would store a page of links.
+
+**Recorded by:** none (options presented via lavish)
+
+## 2026-09-08 18:48 PDT - After a crashed crawl, its pages are kept and publishing waits for a full crawl
+
+**Decision:** When a new crawl takes over the marker a crashed one left, the crashed crawl's pages are kept. Publishing stays refused until a crawl runs in force mode, visiting every address rather than skipping ones that look unchanged, so that every waiting page is known to come from one run. Chosen from three options.
+
+**Why:** This is the decision recorded earlier as the one that could not be made without the user, and it settles the three-part fix to the fetch marker. Keeping the pages destroys nothing an administrator was reviewing. Waiting for a force crawl is the only condition under which the waiting set is provably from one run, because a refresh skips pages and a skipped page keeps whatever version was there. On a site this size a force crawl is minutes.
+
+What this unblocks, all in the specification covering fetching: a running crawl refreshes its marker so a slow crawl is not mistaken for a dead one; a crawl that has lost its marker is refused when it tries to save a page; a takeover is recorded so publishing knows to wait; and a completed force crawl clears that record.
+
+**Alternatives rejected:** Deleting the crashed crawl's pages on takeover, which is simpler and destroys review work. Leaving the gap recorded, which is the outcome the review step exists to prevent.
+
+**Recorded by:** none (options presented via lavish)
+
+## 2026-09-08 18:48 PDT - The one page count in the log is replaced, and the rule was explained badly
+
+**Decision:** Replace the page count in the earliest entry with a proportion. Nothing else changes, because nothing configures a page count.
+
+**Why:** The user read the naming rule as requiring a page count to be configured in advance, and asked why that was needed when the crawl discovers the pages itself. It is not needed and nothing does it. The rule bans counts from every file except the configuration; it does not ask the configuration to hold one, and it does not. The explanation that produced the misreading said a count "may appear in one file only", which reads as permission to put one there rather than as a ban everywhere else.
+
+The user's objection still lands on the entry it was aimed at. Its numbers described the original system's site, and they were the last page count anywhere in the repository. Replacing them with a proportion means the rule holds with no exception to remember, which is the outcome asked for.
+
+**Alternatives rejected:** Leaving the entry as written under the log's convention. The convention protects reasoning from being rewritten; a number is not reasoning.
+
+**Recorded by:** none (options presented via lavish)
+
+## 2026-09-08 19:09 PDT - The live tier ran: thirty-two pass, and the one failure was the test
+
+**Decision:** Compare a stored vector to what was written element by element at float32 precision, not by the spelling of its text form. Record what the first run against a real server measured, and promote the claims that rested on it.
+
+**Why:** The live tier ran for the first time, with the credentials read from the installer's file rather than typed. Thirty-one of thirty-two passed. The one failure asserted that the string `0.000012` survived the round trip through the vector column; the server stored the value and read it back as `1.20000004e-05`, the same float32 number spelled the server's way. The round trip never promised a spelling. The test now parses each element and compares the numbers, and all thirty-two pass.
+
+Three claims move from unmeasured to measured. A session variable set on one connection reads as NULL on another, which is the hazard behind the pinned-connection constraint. A bound parameter through the vector's string constructor is refused, which means the variable and the pin are both required rather than a caution. And the transaction that publishes gets the isolation level it asks for.
+
+One question recorded as not needing an answer got one anyway. The column and the string constructor both accept exponent notation, measured with a probe against a scratch database. The plain-decimal formatting chosen yesterday was hedging against a limitation that does not exist. It stays, because it is proven and pinned and costs a few characters per element, but the code comment now says why it was chosen rather than claiming the question is open.
+
+The run also corrected a number this log has repeated: the live tier is thirty-two tests, not thirty-five.
+
+**Alternatives rejected:** Switching the vector literal back to the shortest form now that exponents are known safe. It would delete a passing test and a recorded decision to save a few bytes per element on a payload measured in tens of kilobytes.
+
+**Recorded by:** none
