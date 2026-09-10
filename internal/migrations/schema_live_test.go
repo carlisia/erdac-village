@@ -179,8 +179,12 @@ func TestLiveMigrationIsIdempotent(t *testing.T) {
 	if tables != 8 {
 		t.Errorf("after three applies: %d tables, want 8", tables)
 	}
-	if versions != 1 {
-		t.Errorf("after three applies: %d migration rows, want 1", versions)
+	all, err := All()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if versions != len(all) {
+		t.Errorf("after three applies: %d migration rows, want %d", versions, len(all))
 	}
 }
 
@@ -669,5 +673,31 @@ SELECT table_name, index_name, non_unique, GROUP_CONCAT(column_name ORDER BY seq
 					table, a.name, a.columns, b.name, b.columns)
 			}
 		}
+	}
+}
+
+// The second migration alters a table rather than creating one, which MySQL
+// cannot make conditional in the statement itself. The file asks the
+// catalogue and prepares the change only when the column is absent, so it
+// must apply once, add the column, and then do nothing on every later run.
+func TestLiveTheSecondMigrationAddsItsColumnOnce(t *testing.T) {
+	db := open(t)
+	var present int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = 'system_state' AND column_name = 'fetch_taken_over_at'`).
+		Scan(&present); err != nil {
+		t.Fatal(err)
+	}
+	if present != 1 {
+		t.Fatalf("the takeover column is present %d times, want 1", present)
+	}
+	apply(t, db)
+	if err := db.QueryRow(`SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = 'system_state' AND column_name = 'fetch_taken_over_at'`).
+		Scan(&present); err != nil {
+		t.Fatal(err)
+	}
+	if present != 1 {
+		t.Errorf("after re-applying, the column is present %d times", present)
 	}
 }

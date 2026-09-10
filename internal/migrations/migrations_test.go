@@ -128,6 +128,24 @@ func TestAFailureWhileReadingVersionsNamesTheOperation(t *testing.T) {
 	}
 }
 
+// MySQL cannot make an ALTER conditional in the statement, so a file that
+// alters a table must ask the catalogue and prepare the change only when it is
+// needed. An ALTER written bare would fail the second time the file runs.
+func TestEveryAlterIsPreparedConditionally(t *testing.T) {
+	all, err := All()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range all {
+		for _, line := range strings.Split(withoutComments(m.SQL), "\n") {
+			if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(line)), "ALTER TABLE") {
+				t.Errorf("%s alters a table outside a prepared statement, so re-running it would fail: %s",
+					m.Name, strings.TrimSpace(line))
+			}
+		}
+	}
+}
+
 // withoutComments drops the line comments from a migration. These files use no
 // other comment form, and a block comment would need handling here before one
 // could be written.
