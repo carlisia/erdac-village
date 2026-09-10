@@ -916,7 +916,7 @@ The same run exposed a second fault. The check script selects live tests with a 
 
 **Decision:** The crawler does not fetch any sitemap address with a single path segment. Chosen from three options presented for review.
 
-**Why:** The survey measured that every alias stub on this site has exactly one path segment and every real page has more, that the capitalisation rule in the configuration catches three stubs in eleven, and that every stub's real target is listed in the sitemap separately. Skipping by shape is therefore exact on this site and loses no page, and it costs nothing, where fetching every stub and dropping it afterwards is dozens of wasted downloads per crawl that only works because stubs happen to be empty.
+**Why:** The survey measured that every alias stub on this site has exactly one path segment and every real page has more, that the capitalisation rule in the configuration catches about a quarter of the stubs sampled, and that every stub's real target is listed in the sitemap separately. Skipping by shape is therefore exact on this site and loses no page, and it costs nothing, where fetching every stub and dropping it afterwards is dozens of wasted downloads per crawl that only works because stubs happen to be empty.
 
 The two addresses the configuration excludes by name are both single-segment, so this rule makes that list redundant. The specification covering fetching decides whether the list stays as documentation or goes.
 
@@ -983,5 +983,119 @@ One question recorded as not needing an answer got one anyway. The column and th
 The run also corrected a number this log has repeated: the live tier is thirty-two tests, not thirty-five.
 
 **Alternatives rejected:** Switching the vector literal back to the shortest form now that exponents are known safe. It would delete a passing test and a recorded decision to save a few bytes per element on a payload measured in tens of kilobytes.
+
+**Recorded by:** none
+
+## 2026-09-08 19:41 PDT - Specification 0002 approved, with three answers
+
+**Decision:** Implement the ingest specification as drafted, with these three answers folded in. The canary text stays empty, so the check is off until a phrase is configured. A candidate, its pieces and their vectors are written by one store method in one transaction, replacing the three separate writers. The command line gets all three subcommands: fetch, review and publish. Presented for review on a page that walked each stage with an invented site.
+
+**Why:** The canary exists to notice a page whose content is assembled in the visitor's browser. The survey found this site's article text arrives in the served page, so there is nothing for the check to catch today, and no phrase was chosen. The command line can supply one for a run, so the day the site changes shape, the check can be turned on without a code change.
+
+The three-write window was the original system's and this port had proposed to keep it. One process dying between the second and third write leaves a page whose pieces have no vectors, and search then cannot find them. Closing it costs one store method and a change to the previous specification's boundary, and the user chose to pay that rather than inherit the gap. The three separate writers go, because nothing would call them and an unused write path is a second way to get the ordering wrong.
+
+All three subcommands, because thin as review and publish are, having them means the whole loop runs from a terminal before the administration pages exist.
+
+**Alternatives rejected:** Configuring a canary phrase now, which needs a phrase from a page the user knows will not change and none was offered. Keeping the three-write window to mirror the original. A fetch-only command line.
+
+**Recorded by:** none (options presented via lavish)
+
+## 2026-09-08 19:41 PDT - A page under the word floor is its own bucket
+
+**Decision:** The ingest report gains a bucket for pages dropped as too short after cleaning, so that every address the sitemap listed still lands in exactly one place.
+
+**Why:** The configuration has carried a word floor since before the store was built, and the survey found it is what removes a folder listing whose article arrives empty. The draft specification's list of buckets left it out. A page dropped for being thin would then have been in no bucket, and the rule that the buckets add up to the sitemap's count, which is the report's way of making a lost page visible, would have been violated by design on the first run. Found while reconciling the approved draft against the configuration, before any code.
+
+**Alternatives rejected:** Counting thin pages as failed, which is what they are not: nothing went wrong, the page has no text.
+
+**Recorded by:** none
+
+## 2026-09-08 20:09 PDT - Specification 0002 built, and the three writers became one
+
+**Decision:** Build ingest as specified. The one change to what already existed: the three store methods that wrote a candidate, its chunks and its vectors became one method in one transaction, and every live test that used them was rewritten to hold the lock first, because the store now refuses a write from a run that does not.
+
+**Why:** The one-method writer is the review answer of earlier today, applied. The lock's three parts landed with it: renewal on an interval from the command, refusal in the writer, and a takeover recorded by a second migration and cleared only by a completed force run. The migrator applied two files against a real server for the first time, which the schema tier now asserts.
+
+Two things the fast tier could not prove and the live tier did: the one-transaction writer leaves nothing of a page whose last statement the server refuses, and a run that lost the lock can neither renew, release, nor write. Two things stay unproven for want of a provider key, and both skip with a reason: the database returns a vector of the declared width, and a refused key produces NULL with a warning that reaches the caller.
+
+**Alternatives rejected:** Embedding the sample pages in the binary so the dry run needs no folder. The dry run is a development tool run from the repository, and a folder argument says so.
+
+**Recorded by:** none
+
+## 2026-09-08 20:09 PDT - Review of the ingest build: fourteen findings acted on
+
+**Decision:** Act on every finding of the two-axis review of specification 0002's build. Three were defects; the rest were the documents overstating what had been measured or naming things the code no longer has.
+
+**Why:** The worst defect was in the completion rule. A force run released the lock saying it had replaced every page whatever its report held, so a force run with one failed page cleared a recorded takeover and let publish proceed over a set that might still hold a crashed run's candidate for that address. The rule is now that only a force run with no failures makes that claim, and it is a method on the report so the command cannot get it wrong.
+
+The second defect was in cutting an oversized section. The cut was by words and the words were joined back with single spaces, so every paragraph break, heading line and list marker inside a long section was lost; the original kept them. The cut is still by words, but it now slices the original text at word boundaries and keeps what lies between.
+
+The third was a duplicate sitemap entry: counted twice in the total and once anywhere else, it made the report announce a fault the run had not committed. Duplicates are their own bucket now, and the accounting includes them.
+
+The documents had drifted in the other direction. The porting notes called the embedding path measured when both tests that would measure it had skipped. Two files still said three store methods refuse a run, a day after they became one. A sample count from the real site had leaked into two documents outside the survey record. The glossary reserved one word for the admin portal that the code and the specification were using as the domain term; the code now says chunk everywhere, and the glossary defines the three terms it had been using without defining.
+
+**Alternatives rejected:** Removing the page-size cap because the original has none. It is a defence against holding memory for something that is not a page, and it is now recorded in the specification as an addition rather than removed to match.
+
+**Recorded by:** code-review
+
+## 2026-09-08 20:21 PDT - The first real fetch, and the provider key comes from the vault
+
+**Decision:** The provider key is read from the environment variable the user's vault names, injected for one command at a time, never typed and never stored in the repository. The site was fetched for real for the first time, in force mode and then as a refresh, into a database created and migrated for the purpose.
+
+**Why:** The key was in the vault under a name for this system rather than the one the code had guessed, so the code was renamed to match. Injecting it per command is what keeps it out of every log and every transcript, and the two live tests that had skipped for want of it both passed the first time they ran: the database returned a vector of the declared width through the pinned connection, and a refused key produced a warning that reached the caller.
+
+The fetch confirmed the survey's shape. Proportions, because the naming rule reserves counts for the configuration file: about a third of the sitemap's entries were skipped as stubs by shape, about a fifth were disallowed by the robots list, a handful of folder pages were dropped as thin, the two entries that are not addresses were named and skipped, the duplicated address was counted once, and the remaining third became candidates. Every entry landed in one bucket and the buckets added up.
+
+A few pages failed on the first pass and the report said so; their reasons were not captured because the output was filtered while it ran, which is a mistake to record rather than repeat. On the refresh that followed, every unchanged page was skipped without being embedded again and the failed pages went through, so the failures were transient. Speculation, marked as such: the pages that failed were the largest, and the provider was slow on a run of serial calls.
+
+Nothing is published. The candidates wait for review, which the command line can list and the administration pages, when they exist, will show.
+
+**Alternatives rejected:** Keeping the guessed variable name and asking the user to alias it, which puts a second name on one secret for no reason.
+
+**Recorded by:** none
+
+## 2026-09-08 20:35 PDT - The MCP server now exposes the real database
+
+**Decision:** Grant the `mcp` account read access to the system's database, point the extension's `schema` at it, and put the database name into `db_url` so an unqualified query works. Everything else stays as decided on 2026-09-07: bearer token required, writes off, a read-only account as the real boundary.
+
+**Why:** The decision of 2026-09-07 exposed "the working schema", which at the time was the spike's. The system's own database was created today, and the account could not see it. With the grant and the schema variable moved, the server listed the five read tools, did not advertise the write tool, refused a `DELETE` outright, and returned the candidate, chunk and embedding counts through its query tool. Measured through the protocol itself, not through the SQL client.
+
+The database name in `db_url` was the last step, and it was found by the first query failing with "no database selected". The query tool runs on that connection, and an agent that follows `list_tables` with a plain `SELECT` would hit the same wall.
+
+**Alternatives rejected:** Leaving the spike schema exposed as well. It is done with, and one exposed schema is one fewer thing to reason about.
+
+**Recorded by:** none
+
+## 2026-09-08 20:43 PDT - The spike's databases are dropped
+
+**Decision:** Drop the three spike databases and the review-workflow prototype's, and revoke the MCP account's read grant on the first of them. Chosen from three options, with leaving everything and keeping the prototype as the others.
+
+**Why:** Each held a table or two of test rows: the three sentences the spike embedded, once per iteration, and the two-table shape the review workflow was measured against before its specification was written. Every measurement they produced is recorded in the porting notes and this log with its date, which is what a spike is for. The databases themselves were the throwaway, and the glossary defines a spike that way.
+
+The grant went with them. A read-only account that can see a database that no longer exists is harmless, but a grant list that names things that do not exist is one more thing to explain.
+
+Nothing in the repository referred to any of them. The vendor's own empty database stays, because it is not this project's.
+
+**Alternatives rejected:** Keeping the prototype for reference. The shape it proved is the shape the schema now has, and the schema is the reference.
+
+**Recorded by:** none
+
+## 2026-09-09 16:56 PDT - The conditional column change is a recorded divergence, not a vendor answer
+
+**Decision:** Keep the second migration's shape, a catalogue check followed by `PREPARE` and `EXECUTE` of the `ALTER` only when the column is absent, and record it in `PORTING.md` as forced, then chosen, measured 2026-09-09. It does not carry the vendor-prescribed label.
+
+**Why:** The repository's rule admits a workaround without a porting entry only when VillageSQL's own documentation prescribes it. The docs check was done: the vendor's schema-migrations guide prescribes a migrations table so reruns are safe and says nothing about a conditional `ALTER`; upstream MySQL's manual permits `ALTER TABLE` inside a prepared statement but prescribes no idiom. Measured the same day: `ADD COLUMN IF NOT EXISTS` is a syntax error (1064) and a repeated plain `ADD COLUMN` fails with 1060. Without the guard, a migration that altered the table and died before recording itself would fail on every retry, because DDL cannot be rolled back.
+
+**Alternatives rejected:** Relying on the version record alone, which is what the vendor's guide describes; it leaves the half-applied case to hand repair. Deciding in Go by reading the catalogue before sending the `ALTER`; that moves a schema decision out of the migration file, where the fast tier's file-reading tests can no longer see it. Claiming the vendor-prescribed label on the strength of the upstream manual; the manual permits the mechanism and prescribes nothing.
+
+**Recorded by:** none
+
+## 2026-09-09 17:01 PDT - File the missing re-runnable-migration section as a contribution
+
+**Decision:** Add `CONTRIBUTIONS.md` entry 22 against `villagesql/villagesql-docs`: the schema-migrations guide promises safe reruns through a migrations table and never covers a file of several statements that dies after its DDL has applied. Marked measured 2026-09-09, the date the server behaviour behind it was observed, so it may be filed.
+
+**Why:** The rule for a gap the stack imposes is that it is recorded twice, in `PORTING.md` for what it cost here and in `CONTRIBUTIONS.md` for what closes it upstream. The porting entry exists since the same day. The upstream side is a documentation section, not a server change, because the re-runnable shape already works on the shipped server; the guide simply does not show it, and a reader who trusts "reruns are safe" meets error 1060 on the retry.
+
+**Alternatives rejected:** Filing against the server for `ADD COLUMN IF NOT EXISTS`; a syntax addition to a MySQL derivative is a far larger ask than a guide section, and the shape that works needs nothing new. Leaving the porting entry as the only record; that keeps the fix private to this port.
 
 **Recorded by:** none
