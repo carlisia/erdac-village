@@ -94,9 +94,10 @@ robots_disallowed = ["/tags/*"]
 # site do not redirect (they return 200 with a meta refresh) and about half
 # carry no capital letter, so neither redirects nor capitalisation identifies
 # them. Every stub has exactly one path segment and every real page has more,
-# and the decision of 2026-09-08 skips single-segment addresses by shape
-# before fetching. Both entries here are single-segment, so that rule covers
-# them; the fetching specification decides whether this list stays.
+# and the crawler skips single-segment addresses by shape before fetching.
+# Both entries here are single-segment, so the shape rule already covers
+# them. They are kept as documentation of the two the survey named by hand;
+# removing them changes nothing.
 default_exclude = ["/404", "/Untitled"]
 
 # Pages about people other than the site owner. Well-formed, on-brand, and not

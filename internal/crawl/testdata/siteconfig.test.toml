@@ -1,0 +1,79 @@
+# The tests' own settings, not any real site's. Reading the real file would put
+# a real site's page structure into the test suite, which is the most widely
+# read part of a repository. Everything here is invented.
+
+[site]
+name        = "Example Consulting"
+url         = "https://example.test"
+sitemap     = "https://example.test/sitemap.xml"
+contact_url = "https://example.test/about/company"
+
+[bot]
+persona = "a careful assistant for this site"
+tone    = "plain"
+topics  = ["what the company does"]
+facts   = []
+
+[messages]
+greeting  = "Ask me anything."
+declined  = "I could not find that."
+halted    = "Paused."
+restarted = "Cleared."
+error     = "Something went wrong."
+
+[models]
+chat_provider      = "anthropic"
+chat_model         = "test-chat"
+embedding_provider = "google"
+embedding_model    = "test-embed"
+
+[retrieval]
+dimensions           = 3072
+distance             = "cosine"
+index                = "none"
+top_k                = 5
+similarity_threshold = 0.25
+
+[chunking]
+split_on           = ["h2", "h3"]
+min_tokens         = 100
+max_tokens         = 800
+tokens_per_word    = 1.4
+provider_token_cap = 2048
+overlap_ratio      = 0.15
+
+[crawl]
+follow_redirects = true
+concurrency      = 4
+timeout_seconds  = 20
+user_agent       = "erdac-village-test"
+
+# Invented: one group the site's robots file disallows.
+robots_disallowed = ["/labels/*"]
+
+# Invented address groups that exercise the shapes an exclusion can take: a
+# whole group, a second whole group, a partial name inside a group, and one
+# exact address.
+default_exclude = [
+  "/guides/*",
+  "/profiles/*",
+  "/policies/tracking-*",
+  "/gatherings/spring-day",
+]
+default_exclude_groups = []
+
+# Low enough that every real sample page passes and only the empty folder
+# listing is dropped.
+min_body_words = 10
+
+strip_selectors = ["nav", "footer", ".w-nav", ".footer_logo", ".w-condition-invisible"]
+
+# The sample pages carry no canary text of their own; tests supply one.
+required_strings = []
+
+[admin]
+session_cookie_name = "test_admin"
+session_max_age     = 3600
+
+[chat]
+status_poll_seconds = 4
