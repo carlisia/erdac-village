@@ -57,6 +57,13 @@ fi
 
 step "tests (fast)" go test -short -count=1 ./...
 
+# The whole ingest pipeline, end to end, against the invented sample pages,
+# with nothing saved. The test configuration is invented too, so no real site
+# is named by this step.
+step "fixtures"     go run ./cmd/ingest fetch \
+                      --config internal/crawl/testdata/siteconfig.test.toml \
+                      --fixtures internal/crawl/testdata/html
+
 if [ -n "${TEST_MYSQL_DSN:-}" ]; then
   live=$(go test -run '^TestLive' -count=1 -json ./... 2>&1)
   status=$?
