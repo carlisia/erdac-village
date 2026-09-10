@@ -64,7 +64,7 @@ If two of anything would break the rules -- two candidates for one address, two 
 
 ## Implementation Decisions
 
-**One implementation, several small interfaces declared where they are used.** A single concrete store type carries every method: read the stored state of every address, upsert a candidate, replace a page's chunks, store embeddings, set an address included or excluded, publish, and read and write system state. Nothing else in the system talks to the database.
+**One implementation, several small interfaces declared where they are used.** A single concrete store type carries every method: read the stored state of every address, store a candidate with its chunks and embeddings, set an address included or excluded, publish, and read and write system state. Nothing else in the system talks to the database. (As written, this listed three separate writers for a candidate, its chunks and its embeddings. Specification 0002 replaced them with one method in one transaction; see its record of the decision.)
 
 No package exports a wide interface listing all of them. Each consumer declares the two to four methods it actually calls, next to the code that calls them. The ingest path declares what ingest needs; the review handlers declare what review needs. One test double can satisfy all of them, so this costs nothing in test code and keeps a caller from depending on methods it never uses.
 
@@ -161,12 +161,14 @@ The reason for the generated-column substitute, the reason there is no vector in
 
 Everything below was built during implementation and is not asked for above. It is recorded here so the specification stays the reference for what the code does, rather than a description of an earlier version of it. Each entry says what was added and what asked for it.
 
-**Thirteen sentinel errors, where this specification names six.** The list is given in full rather than counted, because a count is a number that drifts out of step with the thing it counts and nothing notices.
+**Fifteen sentinel errors, where this specification names six.** The list is given in full rather than counted, because a count is a number that drifts out of step with the thing it counts and nothing notices.
 
 Named here: a fetch already running, a halted assistant, a publish attempted during a fetch, the two duplicate-key violations, and an address longer than the column. Added during implementation, each with its reason:
 
 - **A deadlock or a lock-wait timeout.** These are the two failures where retrying is correct, and every other failure means the opposite. A caller that cannot tell them apart either retries nothing or retries everything.
 - **An abandoned fetch.** Described below; it carries behaviour this specification does not ask for.
+- **An embedding that returned nothing.** Added by specification 0002: the database's embedding function reports failure by returning NULL and a warning rather than by raising, and this carries the warning's text.
+- **A takeover pending.** Added by specification 0002: a fetch took over an abandoned lock, so the candidate set may hold two runs' pages, and publish is refused until a force fetch completes.
 - **A release refused because the lock is no longer this run's.** A run that overran the expiry has had its lock taken by another fetch. Clearing it then would release a lock a live run is relying on, so the release is refused. No story asks for this; it follows from the expiry existing at all.
 - **The system-state row missing.** The migration seeds one row, so its absence means the database was not brought up properly, and that has a different remedy from any driver failure.
 - **An embedding of the wrong width.** The column is declared at one width and the embedding function offers no way to ask for another, so a different width is a fault in the caller rather than a configuration choice.
