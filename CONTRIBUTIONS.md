@@ -49,6 +49,8 @@ The row is inserted, the value is NULL, `ROW_COUNT()` reports success, and the f
 
 Proposal: a session variable, say `vsql_ai.strict`, that makes failures abort the statement. Keep the current behaviour as the default for compatibility.
 
+A consequence for `vsql_mcp`, measured on each side and joined by inference: its `query` tool accepts exactly one read-only statement per call, and the function reports failure as NULL plus a warning readable only by a following `SHOW WARNINGS`. An agent that calls `ai_embedding` or `ai_prompt` through the tool therefore sees NULL and can never see why.
+
 ### 4. `vsql_vector`'s vector-argument rule is real, but described wrongly
 
 **Status:** measured 2026-09-07. **Repo:** `villagesql/vsql-vector`.
@@ -96,6 +98,8 @@ The bundled `villagesql` wrapper starts `mysqld` with `--no-defaults`, which sup
 Nothing warns the user. The variable simply reads OFF again and `INSTALL EXTENSION` fails with a message about preview capabilities, pointing at the symptom rather than the cause.
 
 Either the wrapper should stop passing `--no-defaults`, or it should read `mysqld-auto.cnf` explicitly, or the documentation should tell users to pass the flag at start instead.
+
+`vsql_mcp` is the sharpest instance, measured 2026-09-08: every one of its settings, including which schema it exposes, the account it queries as and the token it requires, is a `SET GLOBAL`. After a restart under the wrapper the MCP listener is off and a client's first symptom is a refused connection with nothing saying why.
 
 ### 8. `veb_dir` differs between the installer's server and the wrapper's instance
 
@@ -193,6 +197,18 @@ The width is recoverable, but only by arithmetic on `character_maximum_length`, 
 
 Including the resolved parameters in `COLUMN_TYPE`, as built-in parameterized types such as `VARCHAR(n)` and `DECIMAL(p,s)` already do, would close it.
 
+Measured 2026-09-08: `vsql_mcp`'s `describe_table` tool reads the same catalogue and reports the column as `vsql_vector.SVECTOR` with no width, so an agent working through MCP cannot learn the declared dimension from the schema tool at all. A stored value's width is recoverable with `VECTOR_DIMENSION(col)`, measured the same day, but that is a property of a row, not of the declaration, and `LENGTH`, `CONVERT` and `JSON_LENGTH` all refuse a vector value with error 1221.
+
+### 21. `vsql_mcp.schema` does not give the query tool a default database
+
+**Status:** measured 2026-09-08. **Repo:** `villagesql/vsql-mcp`.
+
+`schema` restricts what the resources and `list_tables` expose. The `query` tool runs on the connection named by `db_url`, and that connection has no default database unless `db_url` names one. The README's own quick start sets `schema = 'mydb'` and a `db_url` with no database, so a reader who follows it and then issues the obvious first query, `SELECT ... FROM sometable`, gets `ERROR 1046: No database selected`. `list_tables` works and shows the table; the query against it fails.
+
+This bites every user of the quick start, and it bites agents worst: an agent follows `list_tables` with an unqualified query as a matter of course, and the error names nothing the agent has seen. The workaround is to put the schema into `db_url`, which the README does not say.
+
+Either would close it: the tool issuing `USE <schema>` on its connection when `schema` is set, or the quick start and the `db_url` row of the configuration table saying the database must be named there.
+
 ## Real, lower priority
 
 ### 16. Custom index types, and then an HNSW index
@@ -222,6 +238,16 @@ One model argument, no fallback. Providers and gateways commonly accept an order
 **Status:** researched. **Repo:** `villagesql/vsql-ai`.
 
 One row is one serial HTTP request, with no batching and no concurrency, and the README says so explicitly. Every embedding provider accepts arrays of inputs; a set-returning or array-accepting form would cut both wall-clock time and request count by a large factor on any real corpus.
+
+### 22. The schema-migrations guide stops one step short of a re-runnable migration
+
+**Status:** measured 2026-09-09. **Repo:** `villagesql/villagesql-docs`.
+
+The schema-migrations guide (`guides/schema-migrations.mdx`) says each migration tool "maintains a migrations table in the database to track which migrations have run, so reruns are safe." The transactions guide says a DDL statement (`CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`) commits implicitly and cannot be rolled back. Neither page joins the two. A migration file holding more than one statement that fails between them has applied its DDL and is recorded nowhere, so the next run re-applies it. Measured: `ADD COLUMN IF NOT EXISTS` is a syntax error (1064), and a plain `ADD COLUMN` run again fails with `Duplicate column name` (1060). The rerun the guide calls safe fails on every attempt until someone repairs the database by hand.
+
+This affects every user of the tools the guide lists, because Flyway, Liquibase, golang-migrate and Alembic all run files of several statements, and it bites hardest on the guide's own "add a nullable column" answer, the migration it presents as the easy case.
+
+The fix is documentation, one section: state that MySQL has no `ADD COLUMN IF NOT EXISTS`, and show the shape that makes an `ALTER` re-runnable, a check of `information_schema.columns` followed by `PREPARE` and `EXECUTE` of the statement only when the column is absent. Upstream MySQL's manual lists `ALTER TABLE` among the statements a prepared statement may hold, so the shape needs no server change. This port uses it in its second migration and proves it by applying the file twice against a live server.
 
 ## Already fixed upstream
 

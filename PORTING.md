@@ -115,6 +115,24 @@ Erdac read its key from an environment variable in the application process and n
 
 Erdac batches 64 texts per HTTP request. `ai_embedding` issues one request per row, serially, holding a server thread for up to 30 seconds per call on a cloud provider. One round trip per chunk, and a page yields several chunks, so a full ingest is a long sequence of them. Performance is out of scope, but `SET SESSION max_execution_time` has to accommodate it. See CONTRIBUTIONS: batched embedding.
 
+## Ingest
+
+### Embedding runs one chunk at a time, inside the database -- forced, measured 2026-09-08
+
+Erdac sends every chunk from every page to a provider in one request and gets one vector per chunk back, paired by position. Here the database function embeds one chunk per call, on one pinned connection with the key in a session variable, and reports failure by returning NULL with a warning rather than by raising. So the pipeline calls it once per chunk, checks every result, and treats a page with any refused chunk as a failed page that is not stored at all. Pairing by position cannot go wrong because there is no position; the cost is one round trip per chunk rather than one per site, and the provider is called serially where the original called it in a batch. Measured with the provider key injected: the store's live tier called the function through the pinned connection with the key in a session variable and read back a vector of the declared width, and a refused key produced NULL with a warning that reached the caller as the sentinel's message.
+
+### Tokens are estimated from words -- chosen, unmeasured
+
+Erdac counts tokens with the exact tokenizer its embedding model uses. This model's tokenizer has no Go implementation, so a chunk's tokens are its word count times a configured factor, rounded up. The floor and ceiling are therefore soft targets; the provider's input limit is enforced as a hard cap that a chunk may not exceed. An oversized section is cut at word boundaries rather than token boundaries, and the text between the words is kept as written, so paragraph breaks and heading lines inside a cut survive it as they did in the original. Unmeasured: the factor is inherited with its derivation and has not been checked against this provider's own counter. See the plan's note on the two inherited constants.
+
+### The fetch lock is enforced, not advisory -- chosen, measured 2026-09-08
+
+Erdac's lock is a row a run claims and releases; nothing checks it on a write. Here the one method that writes a candidate refuses a run that no longer holds the lock, under a shared lock on the row, a running crawl renews the lock on an interval, and taking over an abandoned lock is recorded so publish refuses until a force fetch completes. All three were added after a review found that the advisory lock let a slow crawl's pages mix with the next run's, and the decision of 2026-09-08 on what to do with a crashed crawl's pages settled the third. Measured in the live tier end to end.
+
+### Three frontier rules the original never needed -- chosen, measured 2026-09-08
+
+Erdac's frontier is configured exclusion patterns and the administrator's review decisions. Here three rules precede them, each from the survey of this site: an entry that is not an absolute address is skipped and named by its exact text, an address matching a configured robots pattern is skipped, and an address with a single path segment is skipped as an alias stub. The last replaces a capitalisation rule the configuration carried, which the survey measured catching about a quarter of the stubs sampled.
+
 ## Schema
 
 ### Partial unique indexes become generated columns -- forced, vendor-prescribed, measured 2026-09-07
@@ -144,6 +162,14 @@ That last case matters: it is the same failure Erdac hit in production, and MySQ
 Erdac's migrations are each wrapped in one transaction, so a failure leaves the schema untouched. Postgres has transactional DDL; MySQL does not. Measured: `START TRANSACTION; CREATE TABLE a (...); ROLLBACK;` leaves the table in place, and a failed second statement does not undo the first.
 
 The guarantee is replaced by idempotence, which is weaker: a partly-applied migration is recoverable by re-running rather than prevented. Every table is declared in a single create-if-absent statement carrying its indexes, constraints and generated columns inline, so no statement can apply without its dependencies, and seed rows are written in a repeatable form.
+
+### A column cannot be added conditionally in one statement -- forced, then chosen, measured 2026-09-09
+
+Erdac declares its whole schema in one file of create-if-absent statements and never alters a table; had it needed to, Postgres accepts `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. The second migration here adds a column to an existing table, and MySQL refuses that form: `ADD COLUMN IF NOT EXISTS` is a syntax error (1064), and a plain `ADD COLUMN` run a second time fails with `Duplicate column name` (1060). Both measured 2026-09-09.
+
+The forced part is the missing syntax. The chosen part is what stands in for it. The migration asks the catalogue (`information_schema.columns`, the server's own table of every column) whether the column is present, builds the `ALTER` as a string only when it is not, and runs that string through `PREPARE` and `EXECUTE`, the server's mechanism for executing a statement held in a variable. Upstream MySQL's manual lists `ALTER TABLE` among the statements a prepared statement may hold, which is why the shape works. VillageSQL's own schema-migrations guide does not prescribe it; that guide prescribes a migrations table so reruns are safe, which this repository also has. So this entry does not carry the vendor-prescribed label that the generated-column entry above carries.
+
+The guard is kept even though the migrator already skips recorded versions, because DDL is not transactional (see `Migrations cannot be transactional` above): a migration that ran its `ALTER` and died before recording itself is recorded nowhere and, without the guard, fails on every retry with error 1060. A version record alone, which is what the vendor's guide describes and what Flyway and golang-migrate do, leaves that half-applied case to be repaired by hand. `TestEveryAlterIsPreparedConditionally` refuses any migration file whose `ALTER` is not inside a prepared string, and `TestLiveTheSecondMigrationAddsItsColumnOnce` applies the file twice against a real server and finds the column once.
 
 ### A URL column cannot be TEXT -- forced, measured 2026-09-07
 
