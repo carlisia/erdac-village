@@ -53,6 +53,7 @@ type PageSummary struct {
 	ID          int64
 	Title       string
 	ContentHash string
+	LastMod     *time.Time
 	FetchedAt   time.Time
 	PublishedAt *time.Time
 }
@@ -82,24 +83,21 @@ type Chunk struct {
 	TokenCount  int
 }
 
-// Embedding is one chunk's vector.
-type Embedding struct {
-	ChunkID int64
-	Vector  []float32
-}
-
 // SystemState is the single row that holds what is true of the running system.
 //
-// FetchLock is empty when no fetch holds it. The three times are pointers
+// FetchLock is empty when no fetch holds it. FetchTakenOverAt is set when a
+// fetch took over an abandoned lock and cleared by a completed force fetch;
+// while it is set, publish refuses. The times are pointers
 // because "never" is a state an administrator needs to see: it is how
 // "nothing changed" is told apart from "nothing was ever reviewed".
 type SystemState struct {
-	Halted          bool
-	SessionEpoch    int
-	FetchLock       string
-	FetchStartedAt  *time.Time
-	LastFetchedAt   *time.Time
-	LastPublishedAt *time.Time
+	Halted           bool
+	SessionEpoch     int
+	FetchLock        string
+	FetchStartedAt   *time.Time
+	FetchTakenOverAt *time.Time
+	LastFetchedAt    *time.Time
+	LastPublishedAt  *time.Time
 }
 
 // checkAddress refuses an address the column cannot hold, before the server

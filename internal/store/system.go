@@ -26,13 +26,15 @@ func (d *DB) SystemState(ctx context.Context) (SystemState, error) {
 		s             SystemState
 		lock          sql.NullString
 		started       sql.NullTime
+		takenOver     sql.NullTime
 		fetched       sql.NullTime
 		lastPublished sql.NullTime
 	)
 	err := d.db.QueryRowContext(ctx, `
-SELECT halted, session_epoch, fetch_lock, fetch_started_at, last_fetched_at, last_published_at
+SELECT halted, session_epoch, fetch_lock, fetch_started_at, fetch_taken_over_at,
+       last_fetched_at, last_published_at
   FROM system_state WHERE id = 1`).
-		Scan(&s.Halted, &s.SessionEpoch, &lock, &started, &fetched, &lastPublished)
+		Scan(&s.Halted, &s.SessionEpoch, &lock, &started, &takenOver, &fetched, &lastPublished)
 	if errors.Is(err, sql.ErrNoRows) {
 		return s, fmt.Errorf("read the system state: %w", ErrNoSystemState)
 	}
@@ -41,6 +43,7 @@ SELECT halted, session_epoch, fetch_lock, fetch_started_at, last_fetched_at, las
 	}
 	s.FetchLock = lock.String
 	s.FetchStartedAt = timeFromColumn(started)
+	s.FetchTakenOverAt = timeFromColumn(takenOver)
 	s.LastFetchedAt = timeFromColumn(fetched)
 	s.LastPublishedAt = timeFromColumn(lastPublished)
 	return s, nil
@@ -141,9 +144,17 @@ func (d *DB) AcquireFetchLock(ctx context.Context, owner string) error {
 		return fmt.Errorf("take the fetch lock, held by %q since %s: %w",
 			lock.owner.String, lock.since(), ErrFetchInProgress)
 	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE system_state SET fetch_lock = ?, fetch_started_at = UTC_TIMESTAMP(6) WHERE id = 1`,
-		owner); err != nil {
+	// Taking over an abandoned lock is recorded, because the crashed run's
+	// pages are still waiting for review and nothing else would say so once
+	// this run finishes cleanly. Publish refuses while the record stands.
+	statement := `UPDATE system_state SET fetch_lock = ?, fetch_started_at = UTC_TIMESTAMP(6) WHERE id = 1`
+	if lock.abandoned() {
+		statement = `UPDATE system_state
+		                SET fetch_lock = ?, fetch_started_at = UTC_TIMESTAMP(6),
+		                    fetch_taken_over_at = COALESCE(fetch_taken_over_at, UTC_TIMESTAMP(6))
+		              WHERE id = 1`
+	}
+	if _, err := tx.ExecContext(ctx, statement, owner); err != nil {
 		return fmt.Errorf("take the fetch lock: %w", translate(err))
 	}
 	if err := tx.Commit(); err != nil {
@@ -152,14 +163,47 @@ func (d *DB) AcquireFetchLock(ctx context.Context, owner string) error {
 	return nil
 }
 
+// RenewFetchLock moves the lock's start time to now, so a crawl that is still
+// running is never mistaken for one that crashed. A crawl calls this on an
+// interval well inside FetchLockTTL. It refuses when the lock is no longer
+// this run's, which tells the crawl to stop rather than write another page.
+func (d *DB) RenewFetchLock(ctx context.Context, owner string) error {
+	tx, err := d.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("renew the fetch lock: %w", translate(err))
+	}
+	defer tx.Rollback()
+
+	lock, err := readFetchLock(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("renew the fetch lock: %w", translate(err))
+	}
+	if lock.owner.String != owner {
+		return fmt.Errorf("renew the fetch lock, now held by %q: %w", lock.owner.String, ErrFetchLockLost)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE system_state SET fetch_started_at = UTC_TIMESTAMP(6) WHERE id = 1`); err != nil {
+		return fmt.Errorf("renew the fetch lock: %w", translate(err))
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("renew the fetch lock: %w", translate(err))
+	}
+	return nil
+}
+
 // ReleaseFetchLock gives the lock up. A nil time releases without recording a
 // fetch, which is what a run that failed must do: recording a fetch time it
 // did not finish would make a failed run look like a completed one.
 //
+// full says the run visited every address rather than skipping ones that
+// looked unchanged. A completed full run is the one condition under which
+// every waiting candidate is known to come from a single run, so it is the
+// only thing that clears a recorded takeover and lets publish proceed again.
+//
 // It refuses when the lock is no longer this run's, which happens when the run
 // took longer than FetchLockTTL and another fetch took the lock over. Clearing
 // it then would release a lock that a live run is relying on.
-func (d *DB) ReleaseFetchLock(ctx context.Context, owner string, fetchedAt *time.Time) error {
+func (d *DB) ReleaseFetchLock(ctx context.Context, owner string, fetchedAt *time.Time, full bool) error {
 	tx, err := d.db.BeginTxx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("release the fetch lock: %w", translate(err))
@@ -186,10 +230,17 @@ func (d *DB) ReleaseFetchLock(ctx context.Context, owner string, fetchedAt *time
 		return fmt.Errorf("release the fetch lock, now held by %q: %w", lock.String, ErrFetchLockLost)
 	}
 
-	if fetchedAt == nil {
+	switch {
+	case fetchedAt == nil:
 		_, err = tx.ExecContext(ctx,
 			`UPDATE system_state SET fetch_lock = NULL, fetch_started_at = NULL WHERE id = 1`)
-	} else {
+	case full:
+		_, err = tx.ExecContext(ctx,
+			`UPDATE system_state
+			    SET fetch_lock = NULL, fetch_started_at = NULL, fetch_taken_over_at = NULL,
+			        last_fetched_at = ?
+			  WHERE id = 1`, fetchedAt.UTC())
+	default:
 		_, err = tx.ExecContext(ctx,
 			`UPDATE system_state SET fetch_lock = NULL, fetch_started_at = NULL, last_fetched_at = ?
 			 WHERE id = 1`, fetchedAt.UTC())
@@ -213,8 +264,9 @@ func (d *DB) ReleaseFetchLock(ctx context.Context, owner string, fetchedAt *time
 func readFetchLock(ctx context.Context, tx *sqlx.Tx) (fetchLock, error) {
 	var f fetchLock
 	err := tx.QueryRowContext(ctx,
-		`SELECT fetch_lock, fetch_started_at, UTC_TIMESTAMP(6) FROM system_state WHERE id = 1 FOR UPDATE`).
-		Scan(&f.owner, &f.startedAt, &f.serverNow)
+		`SELECT fetch_lock, fetch_started_at, fetch_taken_over_at, UTC_TIMESTAMP(6)
+		   FROM system_state WHERE id = 1 FOR UPDATE`).
+		Scan(&f.owner, &f.startedAt, &f.takenOverAt, &f.serverNow)
 	if errors.Is(err, sql.ErrNoRows) {
 		return f, ErrNoSystemState
 	}
@@ -226,9 +278,10 @@ func readFetchLock(ctx context.Context, tx *sqlx.Tx) (fetchLock, error) {
 // server's clock said at that instant. The three are only meaningful together,
 // which is why they are read in one statement and carried as one value.
 type fetchLock struct {
-	owner     sql.NullString
-	startedAt sql.NullTime
-	serverNow time.Time
+	owner       sql.NullString
+	startedAt   sql.NullTime
+	takenOverAt sql.NullTime
+	serverNow   time.Time
 }
 
 // held reports whether the lock was live at the moment it was read. The moment

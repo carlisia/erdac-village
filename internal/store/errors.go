@@ -37,6 +37,17 @@ var (
 	// publish refuses until a fetch runs to completion and replaces them.
 	ErrAbandonedFetch = errors.New("the last fetch did not finish, so its candidate set is partial")
 
+	// ErrTakeoverPending reports that a fetch took over an abandoned lock, so
+	// the candidate set may hold pages from two runs. Publish refuses until a
+	// fetch run in force mode completes, which is the only condition under
+	// which every waiting page is known to come from one run.
+	ErrTakeoverPending = errors.New("a fetch took over an abandoned lock; publish waits for a completed force fetch")
+
+	// ErrEmbeddingFailed reports that the database's embedding function
+	// returned nothing. It does not raise; it returns NULL and a warning, and
+	// this carries the warning's text so the reason reaches a reader.
+	ErrEmbeddingFailed = errors.New("the embedding function returned nothing")
+
 	// ErrHalted reports that an administrator has halted the assistant.
 	//
 	// Nothing in this package returns it. It is declared beside SetHalted,

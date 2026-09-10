@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jmoiron/sqlx"
 )
 
 // addressStatesQuery reads what is known about every address in one pass.
@@ -21,8 +23,8 @@ import (
 const addressStatesQuery = `
 SELECT a.url,
        COALESCE(s.included, TRUE) AS included,
-       p.id, p.title, p.content_hash, p.fetched_at, p.published_at,
-       c.id, c.title, c.content_hash, c.fetched_at, c.published_at
+       p.id, p.title, p.content_hash, p.lastmod, p.fetched_at, p.published_at,
+       c.id, c.title, c.content_hash, c.lastmod, c.fetched_at, c.published_at
   FROM (SELECT url FROM documents GROUP BY url
         UNION
         SELECT url FROM address_settings) AS a
@@ -47,6 +49,7 @@ type nullablePageSummary struct {
 	id          sql.NullInt64
 	title       sql.NullString
 	contentHash sql.NullString
+	lastMod     sql.NullTime
 	fetchedAt   sql.NullTime
 	publishedAt sql.NullTime
 }
@@ -55,7 +58,7 @@ type nullablePageSummary struct {
 // them. Keeping the order here, next to the column list above, is what stops
 // the two drifting apart.
 func (n *nullablePageSummary) scanInto() []any {
-	return []any{&n.id, &n.title, &n.contentHash, &n.fetchedAt, &n.publishedAt}
+	return []any{&n.id, &n.title, &n.contentHash, &n.lastMod, &n.fetchedAt, &n.publishedAt}
 }
 
 // summary returns nil when the join matched no page, which is how the caller
@@ -68,6 +71,7 @@ func (n nullablePageSummary) summary() *PageSummary {
 		ID:          n.id.Int64,
 		Title:       n.title.String,
 		ContentHash: n.contentHash.String,
+		LastMod:     timeFromColumn(n.lastMod),
 		FetchedAt:   n.fetchedAt.Time.UTC(),
 		PublishedAt: timeFromColumn(n.publishedAt),
 	}
@@ -113,35 +117,56 @@ func (d *DB) AddressStates(ctx context.Context) ([]AddressState, error) {
 	return out, nil
 }
 
-// UpsertCandidate stores a fetched page as a candidate and returns its
-// identifier. A page is never stored published, so nothing this method writes
-// can answer a visitor before an administrator has approved it.
+// StoreCandidate writes a fetched page as a candidate together with its chunks
+// and their vectors, all in one transaction, and returns the page's identifier.
 //
-// Re-fetching an address overwrites its candidate rather than adding a second
-// one, and leaves the published page for that address untouched, which is what
-// lets a refresh run while the assistant keeps answering.
+// A page is never stored published, so nothing this writes can answer a
+// visitor before an administrator has approved it. Re-fetching an address
+// overwrites its candidate rather than adding a second one, and leaves the
+// published page for that address untouched, which is what lets a refresh run
+// while the assistant keeps answering.
 //
-// It looks the candidate up and then writes, inside one transaction, rather
-// than inserting with an on-duplicate clause. The dialect has no RETURNING, so
-// the on-duplicate form has to recover the identifier by assigning it to
-// itself, and MySQL skips the whole update when every assigned value is
-// already what it was. A caller re-fetching an unchanged page would then get
-// no identifier at all, and the chunk write that followed would fail against a
-// page that does exist. The lookup costs one more round trip and cannot do
-// that; it also closes the gap between two fetches of one address, because the
-// row it finds is locked until the transaction ends.
-func (d *DB) UpsertCandidate(ctx context.Context, p Page) (int64, error) {
+// One transaction, by decision. The original wrote the candidate, its chunks
+// and its vectors as three calls and accepted the window between them, in
+// which a process dying left a page whose chunks had no vectors and which
+// search then could not find. Here the three land together or not at all.
+//
+// It refuses a run that no longer holds the fetch lock. The lock was advisory
+// until this method: a run that overran the expiry and lost the lock to a
+// newer fetch could keep writing, and the two runs' pages mixed into one set.
+// The lock row is read under a shared lock inside the transaction, so a
+// takeover cannot slip between the check and the write.
+//
+// The candidate is looked up and then written rather than inserted with an
+// on-duplicate clause, because this dialect has no RETURNING and the
+// on-duplicate form recovers the identifier by assigning it to itself, which
+// MySQL skips when nothing changed. Chunk identifiers are collected one insert
+// at a time, because consecutive identifiers for a batch are only guaranteed
+// under one of the server's three allocation modes and the default is not it.
+func (d *DB) StoreCandidate(ctx context.Context, owner string, p Page, chunks []Chunk, vectors [][]float32) (int64, error) {
 	if err := checkAddress(p.URL); err != nil {
 		return 0, fmt.Errorf("store candidate: %w", err)
 	}
+	if len(vectors) != len(chunks) {
+		return 0, fmt.Errorf("store candidate %s: %d chunks but %d vectors; pairing them by position would attach the wrong meaning to the wrong text",
+			p.URL, len(chunks), len(vectors))
+	}
+	for i, v := range vectors {
+		if err := checkVector(v); err != nil {
+			return 0, fmt.Errorf("store candidate %s, chunk %d: %w", p.URL, chunks[i].Ordinal, err)
+		}
+	}
+
 	tx, err := d.db.BeginTxx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("store candidate %s: %w", p.URL, translate(err))
 	}
 	defer tx.Rollback()
 
-	// The generated column is matched rather than the state, so this meets the
-	// unique index and can find at most one row.
+	if err := requireLock(ctx, tx, owner); err != nil {
+		return 0, fmt.Errorf("store candidate %s: %w", p.URL, err)
+	}
+
 	var id int64
 	err = tx.QueryRowContext(ctx,
 		`SELECT id FROM documents WHERE url_candidate = ? FOR UPDATE`, p.URL).Scan(&id)
@@ -156,7 +181,7 @@ func (d *DB) UpsertCandidate(ctx context.Context, p Page) (int64, error) {
 			return 0, fmt.Errorf("store candidate %s: %w", p.URL, translate(err))
 		}
 		if id, err = res.LastInsertId(); err != nil {
-			return 0, fmt.Errorf("store candidate %s: %w", p.URL, translate(err))
+			return 0, fmt.Errorf("store candidate %s: %w", p.URL, err)
 		}
 	case err != nil:
 		return 0, fmt.Errorf("store candidate %s: %w", p.URL, translate(err))
@@ -171,85 +196,56 @@ func (d *DB) UpsertCandidate(ctx context.Context, p Page) (int64, error) {
 			return 0, fmt.Errorf("store candidate %s: %w", p.URL, translate(err))
 		}
 	}
+
+	// Replacing rather than appending keeps a re-fetch from leaving the previous
+	// run's chunks behind. Deleting the chunks deletes their vectors too.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM chunks WHERE document_id = ?`, id); err != nil {
+		return 0, fmt.Errorf("store candidate %s: replace chunks: %w", p.URL, translate(err))
+	}
+	for i, c := range chunks {
+		res, err := tx.ExecContext(ctx,
+			`INSERT INTO chunks (document_id, ordinal, heading_path, text, token_count)
+			 VALUES (?, ?, ?, ?, ?)`,
+			id, c.Ordinal, nullString(c.HeadingPath), c.Text, c.TokenCount)
+		if err != nil {
+			return 0, fmt.Errorf("store candidate %s, chunk %d: %w", p.URL, c.Ordinal, translate(err))
+		}
+		chunkID, err := res.LastInsertId()
+		if err != nil {
+			return 0, fmt.Errorf("store candidate %s, chunk %d: %w", p.URL, c.Ordinal, err)
+		}
+		// The vector is concatenated as a literal because nothing casts a
+		// computed vector into the fixed-width column type. See formatVector
+		// for why that is safe.
+		statement := `INSERT INTO embeddings (chunk_id, embedding) VALUES (?, '` +
+			formatVector(vectors[i]) + `')`
+		if _, err := tx.ExecContext(ctx, statement, chunkID); err != nil {
+			return 0, fmt.Errorf("store candidate %s, chunk %d: embedding: %w", p.URL, c.Ordinal, translate(err))
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("store candidate %s: %w", p.URL, translate(err))
 	}
 	return id, nil
 }
 
-// ReplaceChunks makes the stored chunks of one page exactly those given, and
-// returns their identifiers in the order they were passed.
-//
-// Replacing rather than appending is what keeps a re-fetch from leaving the
-// previous run's chunks behind. Deleting the old rows also deletes their
-// vectors, because the embedding cascade hangs off the chunk.
-//
-// Identifiers are collected one insert at a time rather than derived from the
-// first of a batch. MySQL only guarantees consecutive automatic identifiers
-// under one of its three allocation modes, and the default is not that one, so
-// a batched insert would return identifiers that are right on most servers.
-func (d *DB) ReplaceChunks(ctx context.Context, pageID int64, chunks []Chunk) ([]int64, error) {
-	tx, err := d.db.BeginTxx(ctx, nil)
+// requireLock refuses a caller that does not hold the fetch lock, under a
+// shared lock on the row so the answer cannot change before the transaction
+// commits. A takeover has to wait for this transaction, and this transaction
+// has to wait for a takeover in progress.
+func requireLock(ctx context.Context, tx *sqlx.Tx, owner string) error {
+	var lock sql.NullString
+	err := tx.QueryRowContext(ctx,
+		`SELECT fetch_lock FROM system_state WHERE id = 1 FOR SHARE`).Scan(&lock)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNoSystemState
+	}
 	if err != nil {
-		return nil, fmt.Errorf("replace chunks of page %d: %w", pageID, translate(err))
+		return translate(err)
 	}
-	defer tx.Rollback()
-
-	if _, err := tx.ExecContext(ctx, `DELETE FROM chunks WHERE document_id = ?`, pageID); err != nil {
-		return nil, fmt.Errorf("replace chunks of page %d: %w", pageID, translate(err))
-	}
-	ids := make([]int64, 0, len(chunks))
-	for _, c := range chunks {
-		res, err := tx.ExecContext(ctx,
-			`INSERT INTO chunks (document_id, ordinal, heading_path, text, token_count)
-			 VALUES (?, ?, ?, ?, ?)`,
-			pageID, c.Ordinal, nullString(c.HeadingPath), c.Text, c.TokenCount)
-		if err != nil {
-			return nil, fmt.Errorf("replace chunks of page %d, ordinal %d: %w",
-				pageID, c.Ordinal, translate(err))
-		}
-		id, err := res.LastInsertId()
-		if err != nil {
-			return nil, fmt.Errorf("replace chunks of page %d, ordinal %d: %w",
-				pageID, c.Ordinal, translate(err))
-		}
-		ids = append(ids, id)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("replace chunks of page %d: %w", pageID, translate(err))
-	}
-	return ids, nil
-}
-
-// StoreEmbeddings writes one vector per chunk, replacing any vector already
-// stored for that chunk.
-//
-// Each vector is concatenated into its statement as a literal rather than
-// bound as a parameter. That is not a shortcut: nothing casts a computed
-// vector into the fixed-width type a column is declared as, so an embedding
-// produced inside the database cannot be stored from SQL at all and has to
-// arrive as text. See formatVector for why the concatenation is safe.
-func (d *DB) StoreEmbeddings(ctx context.Context, embeddings []Embedding) error {
-	for _, e := range embeddings {
-		if err := checkVector(e.Vector); err != nil {
-			return fmt.Errorf("store embedding for chunk %d: %w", e.ChunkID, err)
-		}
-	}
-	tx, err := d.db.BeginTxx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("store embeddings: %w", translate(err))
-	}
-	defer tx.Rollback()
-
-	for _, e := range embeddings {
-		statement := `INSERT INTO embeddings (chunk_id, embedding) VALUES (?, '` +
-			formatVector(e.Vector) + `') ON DUPLICATE KEY UPDATE embedding = VALUES(embedding)`
-		if _, err := tx.ExecContext(ctx, statement, e.ChunkID); err != nil {
-			return fmt.Errorf("store embedding for chunk %d: %w", e.ChunkID, translate(err))
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store embeddings: %w", translate(err))
+	if lock.String != owner {
+		return fmt.Errorf("the lock is held by %q: %w", lock.String, ErrFetchLockLost)
 	}
 	return nil
 }

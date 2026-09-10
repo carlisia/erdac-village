@@ -80,6 +80,12 @@ func (d *DB) Publish(ctx context.Context, at time.Time) (PublishResult, error) {
 		return result, fmt.Errorf("publish: last held by %q since %s: %w",
 			lock.owner.String, lock.since(), ErrAbandonedFetch)
 	}
+	// A takeover happened and no force fetch has completed since. The waiting
+	// pages may be two runs' worth, and nothing else in the row would say so.
+	if lock.takenOverAt.Valid {
+		return result, fmt.Errorf("publish: takeover recorded at %s: %w",
+			lock.takenOverAt.Time.UTC().Format(time.RFC3339), ErrTakeoverPending)
+	}
 
 	// The candidate set, locked, so nothing is added to it while this runs.
 	// An address with no recorded judgement is included, which is why the

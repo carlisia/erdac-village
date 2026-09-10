@@ -55,7 +55,7 @@ func frag(s string) string { return regexp.QuoteMeta(s) }
 // lockReadStatement is the read that takes the lock, its start time and the
 // server's clock together. It is named because eleven tests stub it, and the
 // three columns have to be listed in the order the statement selects them.
-const lockReadStatement = "SELECT fetch_lock, fetch_started_at, UTC_TIMESTAMP(6) FROM system_state"
+const lockReadStatement = "SELECT fetch_lock, fetch_started_at, fetch_taken_over_at, UTC_TIMESTAMP(6)"
 
 // expectLockRead stubs that read.
 //
@@ -68,10 +68,31 @@ const lockReadStatement = "SELECT fetch_lock, fetch_started_at, UTC_TIMESTAMP(6)
 // eleven times it was eleven chances to get the order wrong, and a wrong order
 // stubs a lock that reads as something else entirely.
 func expectLockRead(mock sqlmock.Sqlmock, owner, startedAt any) {
-	mock.ExpectQuery(frag(lockReadStatement)).
-		WillReturnRows(sqlmock.NewRows([]string{"fetch_lock", "fetch_started_at", "now"}).
-			AddRow(owner, startedAt, testTime))
+	expectLockReadWithTakeover(mock, owner, startedAt, nil)
 }
+
+// expectLockReadWithTakeover is the same read with a recorded takeover.
+func expectLockReadWithTakeover(mock sqlmock.Sqlmock, owner, startedAt, takenOverAt any) {
+	mock.ExpectQuery(frag(lockReadStatement)).
+		WillReturnRows(sqlmock.NewRows([]string{"fetch_lock", "fetch_started_at", "fetch_taken_over_at", "now"}).
+			AddRow(owner, startedAt, takenOverAt, testTime))
+}
+
+// expectHeldLock stubs the shared-lock read that every candidate write makes
+// first, answering that the given run holds the lock.
+func expectHeldLock(mock sqlmock.Sqlmock, owner any) {
+	mock.ExpectQuery(frag("SELECT fetch_lock FROM system_state WHERE id = 1 FOR SHARE")).
+		WillReturnRows(sqlmock.NewRows([]string{"fetch_lock"}).AddRow(owner))
+}
+
+// expectNoCandidate stubs the lookup that precedes an insert.
+func expectNoCandidate(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery(frag("SELECT id FROM documents WHERE url_candidate")).WillReturnError(sql.ErrNoRows)
+}
+
+var noVectors [][]float32
+
+func fullVector() []float32 { return make([]float32, config.MaxVectorDimensions) }
 
 var testTime = time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
 
@@ -203,13 +224,120 @@ func TestPublishIsRefusedAfterAnAbandonedFetch(t *testing.T) {
 	}
 }
 
+// Taking a free lock records nothing. The takeover column is only ever set when
+// an abandoned lock is taken over, because that is the only case in which the
+// waiting pages might be two runs' worth.
+func TestTakingAFreeLockRecordsNoTakeover(t *testing.T) {
+	db, mock := newMock(t)
+	mock.ExpectBegin()
+	expectLockRead(mock, nil, nil)
+	mock.ExpectExec(regexp.QuoteMeta("SET fetch_lock = ?, fetch_started_at = UTC_TIMESTAMP(6) WHERE id = 1")).
+		WithArgs("run-1").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := db.AcquireFetchLock(context.Background(), "run-1"); err != nil {
+		t.Fatalf("take a free lock: %v", err)
+	}
+}
+
+// After a takeover, the waiting pages may be two runs' worth and nothing else
+// in the row says so. Publish must refuse until a force fetch has replaced
+// every page, even when the lock itself is free.
+func TestPublishIsRefusedWhileATakeoverIsRecorded(t *testing.T) {
+	db, mock := newMock(t)
+	mock.ExpectBegin()
+	expectLockReadWithTakeover(mock, nil, nil, testTime.Add(-time.Hour))
+	mock.ExpectRollback()
+
+	_, err := db.Publish(context.Background(), testTime)
+	if !errors.Is(err, ErrTakeoverPending) {
+		t.Fatalf("got %v, want ErrTakeoverPending", err)
+	}
+}
+
+// A slow crawl renews its lock; a crawl that lost it is told so, which is its
+// signal to stop rather than write another page.
+func TestRenewingALostLockIsRefused(t *testing.T) {
+	db, mock := newMock(t)
+	mock.ExpectBegin()
+	expectLockRead(mock, "run-2", testTime.Add(-time.Minute))
+	mock.ExpectRollback()
+
+	if err := db.RenewFetchLock(context.Background(), "run-1"); !errors.Is(err, ErrFetchLockLost) {
+		t.Fatalf("got %v, want ErrFetchLockLost", err)
+	}
+}
+
+func TestRenewingAHeldLockMovesItsStart(t *testing.T) {
+	db, mock := newMock(t)
+	mock.ExpectBegin()
+	expectLockRead(mock, "run-1", testTime.Add(-20*time.Minute))
+	mock.ExpectExec(frag("SET fetch_started_at = UTC_TIMESTAMP(6)")).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := db.RenewFetchLock(context.Background(), "run-1"); err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+}
+
+// Only a completed force run clears a recorded takeover, because only a force
+// run has visited every address. A refresh that completes leaves it standing.
+func TestOnlyACompletedForceRunClearsATakeover(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		full   bool
+		clears bool
+	}{
+		{"a completed refresh", false, false},
+		{"a completed force run", true, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			db, mock := newMock(t)
+			mock.ExpectBegin()
+			mock.ExpectQuery(frag("SELECT fetch_lock FROM system_state")).
+				WillReturnRows(sqlmock.NewRows([]string{"fetch_lock"}).AddRow("run-1"))
+			if c.clears {
+				mock.ExpectExec(frag("fetch_taken_over_at = NULL")).WillReturnResult(sqlmock.NewResult(0, 1))
+			} else {
+				mock.ExpectExec(regexp.QuoteMeta("SET fetch_lock = NULL, fetch_started_at = NULL, last_fetched_at = ?")).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			}
+			mock.ExpectCommit()
+			if err := db.ReleaseFetchLock(context.Background(), "run-1", &testTime, c.full); err != nil {
+				t.Fatalf("release: %v", err)
+			}
+		})
+	}
+}
+
+// The text form the embedding function returns is parsed into a slice. The
+// server may spell an element with an exponent, measured, and the slice must
+// be the declared width or nothing.
+func TestParseVector(t *testing.T) {
+	got, err := parseVector(" [0.1, -0.1,1.2e-05,0] ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []float32{0.1, -0.1, 1.2e-05, 0}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("element %d: got %v, want %v", i, got[i], want[i])
+		}
+	}
+	for _, bad := range []string{"", "0.1,0.2", "[]", "[0.1,x]", "[0.1,0.2"} {
+		if _, err := parseVector(bad); err == nil {
+			t.Errorf("%q was parsed as a vector", bad)
+		}
+	}
+}
+
 // The other half of the same rule: a crashed run must not lock the system out,
 // so a new fetch still takes the expired lock over.
 func TestAnAbandonedLockStillLetsANewFetchStart(t *testing.T) {
 	db, mock := newMock(t)
 	mock.ExpectBegin()
 	expectLockRead(mock, "crashed", testTime.Add(-FetchLockTTL-time.Minute))
-	mock.ExpectExec(frag("SET fetch_lock = ?, fetch_started_at = UTC_TIMESTAMP(6)")).
+	mock.ExpectExec(frag("fetch_taken_over_at = COALESCE(fetch_taken_over_at, UTC_TIMESTAMP(6))")).
 		WithArgs("run-2").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
@@ -254,14 +382,14 @@ func TestDuplicateKeysBecomeDistinctDomainErrors(t *testing.T) {
 		t.Run(c.index, func(t *testing.T) {
 			db, mock := newMock(t)
 			mock.ExpectBegin()
-			mock.ExpectQuery(frag("SELECT id FROM documents WHERE url_candidate")).
-				WillReturnError(sql.ErrNoRows)
+			expectHeldLock(mock, "run")
+			expectNoCandidate(mock)
 			mock.ExpectExec(frag("INSERT INTO documents")).WillReturnError(&mysql.MySQLError{
 				Number:  errDuplicateEntry,
 				Message: "Duplicate entry '/about' for key '" + c.index + "'",
 			})
 			mock.ExpectRollback()
-			_, err := db.UpsertCandidate(context.Background(), Page{URL: "/about", FetchedAt: testTime})
+			_, err := db.StoreCandidate(context.Background(), "run", Page{URL: "/about", FetchedAt: testTime}, nil, noVectors)
 			if !errors.Is(err, c.want) {
 				t.Fatalf("got %v, want %v", err, c.want)
 			}
@@ -275,6 +403,9 @@ func TestDuplicateKeysBecomeDistinctDomainErrors(t *testing.T) {
 func TestAnUnrelatedDuplicateIsNotTranslated(t *testing.T) {
 	db, mock := newMock(t)
 	mock.ExpectBegin()
+	expectHeldLock(mock, "run")
+	expectNoCandidate(mock)
+	mock.ExpectExec(frag("INSERT INTO documents")).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(frag("DELETE FROM chunks")).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(frag("INSERT INTO chunks")).WillReturnError(&mysql.MySQLError{
 		Number:  errDuplicateEntry,
@@ -282,7 +413,8 @@ func TestAnUnrelatedDuplicateIsNotTranslated(t *testing.T) {
 	})
 	mock.ExpectRollback()
 
-	_, err := db.ReplaceChunks(context.Background(), 1, []Chunk{{Ordinal: 0, Text: "t"}})
+	_, err := db.StoreCandidate(context.Background(), "run", Page{URL: "/x", FetchedAt: testTime},
+		[]Chunk{{Ordinal: 0, Text: "t"}}, [][]float32{fullVector()})
 	if err == nil {
 		t.Fatal("the duplicate was not reported at all")
 	}
@@ -306,11 +438,11 @@ func TestTransientDatabaseFailuresAreTheirOwnClass(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			db, mock := newMock(t)
 			mock.ExpectBegin()
-			mock.ExpectQuery(frag("SELECT id FROM documents WHERE url_candidate")).
+			mock.ExpectQuery(frag("SELECT fetch_lock FROM system_state WHERE id = 1 FOR SHARE")).
 				WillReturnError(&mysql.MySQLError{Number: c.number, Message: c.name})
 			mock.ExpectRollback()
 
-			_, err := db.UpsertCandidate(context.Background(), Page{URL: "/x", FetchedAt: testTime})
+			_, err := db.StoreCandidate(context.Background(), "run", Page{URL: "/x", FetchedAt: testTime}, nil, noVectors)
 			if !errors.Is(err, ErrConflict) {
 				t.Fatalf("got %v, want ErrConflict", err)
 			}
@@ -352,11 +484,11 @@ func TestAMissingSystemStateRowIsNamedByEveryReader(t *testing.T) {
 			noRow(m, "SELECT fetch_lock FROM system_state")
 			m.ExpectRollback()
 		}, func(d *DB) error {
-			return d.ReleaseFetchLock(context.Background(), "run", nil)
+			return d.ReleaseFetchLock(context.Background(), "run", nil, false)
 		}},
 		{"take the fetch lock", func(m sqlmock.Sqlmock) {
 			m.ExpectBegin()
-			noRow(m, "SELECT fetch_lock, fetch_started_at, UTC_TIMESTAMP(6) FROM system_state")
+			noRow(m, lockReadStatement)
 			m.ExpectRollback()
 		}, func(d *DB) error {
 			return d.AcquireFetchLock(context.Background(), "run")
@@ -417,9 +549,9 @@ func TestAFailureMidIterationIsTranslatedAndNamed(t *testing.T) {
 	mock.ExpectQuery(frag("FROM address_settings")).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"url", "included",
-			"id", "title", "content_hash", "fetched_at", "published_at",
-			"id", "title", "content_hash", "fetched_at", "published_at",
-		}).AddRow("/one", true, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil).
+			"id", "title", "content_hash", "lastmod", "fetched_at", "published_at",
+			"id", "title", "content_hash", "lastmod", "fetched_at", "published_at",
+		}).AddRow("/one", true, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil).
 			RowError(0, &mysql.MySQLError{Number: errLockDeadlock, Message: "Deadlock found"}))
 
 	_, err := db.AddressStates(context.Background())
@@ -463,7 +595,7 @@ func TestReleasingALockNobodyHoldsSaysSo(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"fetch_lock"}).AddRow(nil))
 	mock.ExpectRollback()
 
-	err := db.ReleaseFetchLock(context.Background(), "run-1", nil)
+	err := db.ReleaseFetchLock(context.Background(), "run-1", nil, false)
 	if !errors.Is(err, ErrFetchLockLost) {
 		t.Fatalf("got %v, want ErrFetchLockLost", err)
 	}
@@ -674,9 +806,9 @@ func TestAnOverlongAddressIsRefusedWithoutAStatement(t *testing.T) {
 	db, _ := newMock(t)
 	long := "/" + strings.Repeat("a", MaxAddressLength)
 
-	_, err := db.UpsertCandidate(context.Background(), Page{URL: long, FetchedAt: testTime})
+	_, err := db.StoreCandidate(context.Background(), "run", Page{URL: long, FetchedAt: testTime}, nil, noVectors)
 	if !errors.Is(err, ErrAddressTooLong) {
-		t.Fatalf("upsert returned %v, want ErrAddressTooLong", err)
+		t.Fatalf("store returned %v, want ErrAddressTooLong", err)
 	}
 	if err := db.SetAddressIncluded(context.Background(), long, false, testTime); !errors.Is(err, ErrAddressTooLong) {
 		t.Fatalf("judgement returned %v, want ErrAddressTooLong", err)
@@ -694,12 +826,13 @@ func TestAMultiByteAddressIsMeasuredInCharacters(t *testing.T) {
 	// difference being asserted.
 	url := "/" + strings.Repeat("é", MaxAddressLength-1)
 	mock.ExpectBegin()
-	mock.ExpectQuery(frag("SELECT id FROM documents WHERE url_candidate")).
-		WillReturnError(sql.ErrNoRows)
+	expectHeldLock(mock, "run")
+	expectNoCandidate(mock)
 	mock.ExpectExec(frag("INSERT INTO documents")).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(frag("DELETE FROM chunks")).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectCommit()
 
-	if _, err := db.UpsertCandidate(context.Background(), Page{URL: url, FetchedAt: testTime}); err != nil {
+	if _, err := db.StoreCandidate(context.Background(), "run", Page{URL: url, FetchedAt: testTime}, nil, noVectors); err != nil {
 		t.Fatalf("an address of %d characters was refused: %v", len([]rune(url)), err)
 	}
 }
@@ -709,15 +842,15 @@ func TestAMultiByteAddressIsMeasuredInCharacters(t *testing.T) {
 func TestTheServersTruncationRefusalIsTranslated(t *testing.T) {
 	db, mock := newMock(t)
 	mock.ExpectBegin()
-	mock.ExpectQuery(frag("SELECT id FROM documents WHERE url_candidate")).
-		WillReturnError(sql.ErrNoRows)
+	expectHeldLock(mock, "run")
+	expectNoCandidate(mock)
 	mock.ExpectExec(frag("INSERT INTO documents")).WillReturnError(&mysql.MySQLError{
 		Number:  errDataTooLong,
 		Message: "Data too long for column 'url' at row 1",
 	})
 	mock.ExpectRollback()
 
-	_, err := db.UpsertCandidate(context.Background(), Page{URL: "/x", FetchedAt: testTime})
+	_, err := db.StoreCandidate(context.Background(), "run", Page{URL: "/x", FetchedAt: testTime}, nil, noVectors)
 	if !errors.Is(err, ErrAddressTooLong) {
 		t.Fatalf("got %v, want ErrAddressTooLong", err)
 	}
@@ -729,15 +862,15 @@ func TestTheServersTruncationRefusalIsTranslated(t *testing.T) {
 func TestAnOverlongColumnThatIsNotTheAddressIsNotTranslated(t *testing.T) {
 	db, mock := newMock(t)
 	mock.ExpectBegin()
-	mock.ExpectQuery(frag("SELECT id FROM documents WHERE url_candidate")).
-		WillReturnError(sql.ErrNoRows)
+	expectHeldLock(mock, "run")
+	expectNoCandidate(mock)
 	mock.ExpectExec(frag("INSERT INTO documents")).WillReturnError(&mysql.MySQLError{
 		Number:  errDataTooLong,
 		Message: "Data too long for column 'title' at row 1",
 	})
 	mock.ExpectRollback()
 
-	_, err := db.UpsertCandidate(context.Background(), Page{URL: "/x", FetchedAt: testTime})
+	_, err := db.StoreCandidate(context.Background(), "run", Page{URL: "/x", FetchedAt: testTime}, nil, noVectors)
 	if err == nil {
 		t.Fatal("an overlong title was not reported at all")
 	}
@@ -754,13 +887,15 @@ func TestAnOverlongColumnThatIsNotTheAddressIsNotTranslated(t *testing.T) {
 func TestReFetchingAnUnchangedPageStillReportsItsIdentifier(t *testing.T) {
 	db, mock := newMock(t)
 	mock.ExpectBegin()
+	expectHeldLock(mock, "run")
 	mock.ExpectQuery(frag("SELECT id FROM documents WHERE url_candidate")).
 		WithArgs("/same").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(42)))
 	mock.ExpectExec(frag("UPDATE documents")).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(frag("DELETE FROM chunks")).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectCommit()
 
-	id, err := db.UpsertCandidate(context.Background(), Page{URL: "/same", FetchedAt: testTime})
+	id, err := db.StoreCandidate(context.Background(), "run", Page{URL: "/same", FetchedAt: testTime}, nil, noVectors)
 	if err != nil {
 		t.Fatalf("re-fetch: %v", err)
 	}
@@ -775,39 +910,68 @@ func TestReFetchingAnUnchangedPageStillReportsItsIdentifier(t *testing.T) {
 // hardest to recover from.
 func TestAWrongWidthEmbeddingRefusesTheWholeBatch(t *testing.T) {
 	db, _ := newMock(t)
-	good := make([]float32, config.MaxVectorDimensions)
-	err := db.StoreEmbeddings(context.Background(), []Embedding{
-		{ChunkID: 1, Vector: good},
-		{ChunkID: 2, Vector: good[:10]},
-	})
+	good := fullVector()
+	_, err := db.StoreCandidate(context.Background(), "run", Page{URL: "/x", FetchedAt: testTime},
+		[]Chunk{{Ordinal: 0, Text: "a"}, {Ordinal: 1, Text: "b"}},
+		[][]float32{good, good[:10]})
 	if !errors.Is(err, ErrWrongVectorWidth) {
 		t.Fatalf("got %v, want ErrWrongVectorWidth", err)
 	}
 	// No expectations registered: nothing was written.
 }
 
-// A page must never end up half embedded: half its text would answer
-// questions and the run would report a failure, which is the state that is
-// hardest to tell apart from a healthy one.
-//
-// What this can prove is that the write opens a transaction and rolls it back.
-// It cannot prove the inserts are inside that transaction, because the mock
-// driver hands every statement the one connection and so sees the same
-// sequence either way. TestLiveAFailedEmbeddingLeavesNoneBehind asserts the
-// atomicity itself, against a server that can actually refuse one.
-func TestAFailedEmbeddingRollsBackTheOnesBeforeIt(t *testing.T) {
+// A page must never end up half stored: the candidate, its chunks and their
+// vectors land together or not at all. A failure on the last vector rolls
+// back everything before it, including the candidate row.
+func TestAFailedEmbeddingRollsBackTheWholePage(t *testing.T) {
 	db, mock := newMock(t)
-	v := make([]float32, config.MaxVectorDimensions)
+	v := fullVector()
 	mock.ExpectBegin()
+	expectHeldLock(mock, "run")
+	expectNoCandidate(mock)
+	mock.ExpectExec(frag("INSERT INTO documents")).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(frag("DELETE FROM chunks")).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(frag("INSERT INTO chunks")).WillReturnResult(sqlmock.NewResult(10, 1))
 	mock.ExpectExec(frag("INSERT INTO embeddings")).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(frag("INSERT INTO chunks")).WillReturnResult(sqlmock.NewResult(11, 1))
 	mock.ExpectExec(frag("INSERT INTO embeddings")).WillReturnError(errors.New("connection lost"))
 	mock.ExpectRollback()
 
-	err := db.StoreEmbeddings(context.Background(), []Embedding{
-		{ChunkID: 1, Vector: v}, {ChunkID: 2, Vector: v},
-	})
+	_, err := db.StoreCandidate(context.Background(), "run", Page{URL: "/x", FetchedAt: testTime},
+		[]Chunk{{Ordinal: 0, Text: "a"}, {Ordinal: 1, Text: "b"}}, [][]float32{v, v})
 	if err == nil {
-		t.Fatal("a failed embedding run was reported as a success")
+		t.Fatal("a failed vector write was reported as a stored page")
+	}
+}
+
+// The lock was advisory until this check. A run that lost the lock to a newer
+// fetch must not write another page, or two runs' pages mix into one set.
+func TestACandidateWriteIsRefusedWithoutTheLock(t *testing.T) {
+	db, mock := newMock(t)
+	mock.ExpectBegin()
+	expectHeldLock(mock, "someone-else")
+	mock.ExpectRollback()
+
+	_, err := db.StoreCandidate(context.Background(), "run", Page{URL: "/x", FetchedAt: testTime}, nil, noVectors)
+	if !errors.Is(err, ErrFetchLockLost) {
+		t.Fatalf("got %v, want ErrFetchLockLost", err)
+	}
+}
+
+// Chunk count and vector count must agree before anything is written. Pairing
+// by position with the counts off attaches the wrong meaning to the wrong text.
+func TestMismatchedChunksAndVectorsAreRefusedWithoutAStatement(t *testing.T) {
+	db, _ := newMock(t)
+	_, err := db.StoreCandidate(context.Background(), "run", Page{URL: "/x", FetchedAt: testTime},
+		[]Chunk{{Ordinal: 0, Text: "a"}}, noVectors)
+	if err == nil {
+		t.Fatal("one chunk and no vectors was accepted")
+	}
+	// The mock refuses an unexpected transaction with an error of its own, so
+	// a bare error check would pass with the count check deleted. The refusal
+	// has to be the store's, naming the mismatch.
+	if !strings.Contains(err.Error(), "1 chunks but 0 vectors") {
+		t.Fatalf("the refusal does not name the mismatch, so it may not be the store's: %v", err)
 	}
 }
 
@@ -868,7 +1032,7 @@ func TestAnAbandonedLockIsTakenOver(t *testing.T) {
 	db, mock := newMock(t)
 	mock.ExpectBegin()
 	expectLockRead(mock, "crashed", testTime.Add(-FetchLockTTL-time.Second))
-	mock.ExpectExec(frag("SET fetch_lock = ?, fetch_started_at = UTC_TIMESTAMP(6)")).
+	mock.ExpectExec(frag("fetch_taken_over_at = COALESCE(fetch_taken_over_at, UTC_TIMESTAMP(6))")).
 		WithArgs("run-2").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
@@ -885,7 +1049,7 @@ func TestReleasingALockAnotherRunTookIsRefused(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"fetch_lock"}).AddRow("run-2"))
 	mock.ExpectRollback()
 
-	if err := db.ReleaseFetchLock(context.Background(), "run-1", &testTime); !errors.Is(err, ErrFetchLockLost) {
+	if err := db.ReleaseFetchLock(context.Background(), "run-1", &testTime, false); !errors.Is(err, ErrFetchLockLost) {
 		t.Fatalf("got %v, want ErrFetchLockLost", err)
 	}
 }
@@ -901,7 +1065,7 @@ func TestAFailedRunReleasesWithoutRecordingAFetch(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
-	if err := db.ReleaseFetchLock(context.Background(), "run-1", nil); err != nil {
+	if err := db.ReleaseFetchLock(context.Background(), "run-1", nil, false); err != nil {
 		t.Fatalf("release: %v", err)
 	}
 }
@@ -957,11 +1121,11 @@ func TestAnAddressWithNoJudgementIsIncluded(t *testing.T) {
 	mock.ExpectQuery(frag("FROM address_settings")).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"url", "included",
-			"id", "title", "content_hash", "fetched_at", "published_at",
-			"id", "title", "content_hash", "fetched_at", "published_at",
+			"id", "title", "content_hash", "lastmod", "fetched_at", "published_at",
+			"id", "title", "content_hash", "lastmod", "fetched_at", "published_at",
 		}).AddRow("/one", true,
-			int64(3), "Live", "live-hash", live, live,
-			int64(7), "Pending", "pending-hash", testTime, nil))
+			int64(3), "Live", "live-hash", live, live, live,
+			int64(7), "Pending", "pending-hash", nil, testTime, nil))
 
 	got, err := db.AddressStates(context.Background())
 	if err != nil {
@@ -1001,11 +1165,11 @@ func TestAnAddressHoldingOnlyOneStateReportsTheOtherAsAbsent(t *testing.T) {
 	mock.ExpectQuery(frag("FROM address_settings")).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"url", "included",
-			"id", "title", "content_hash", "fetched_at", "published_at",
-			"id", "title", "content_hash", "fetched_at", "published_at",
+			"id", "title", "content_hash", "lastmod", "fetched_at", "published_at",
+			"id", "title", "content_hash", "lastmod", "fetched_at", "published_at",
 		}).AddRow("/only-pending", false,
-			nil, nil, nil, nil, nil,
-			int64(9), nil, "h", testTime, nil))
+			nil, nil, nil, nil, nil, nil,
+			int64(9), nil, "h", nil, testTime, nil))
 
 	got, err := db.AddressStates(context.Background())
 	if err != nil {
