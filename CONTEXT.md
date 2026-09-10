@@ -20,11 +20,21 @@ Terms used across this repository where two readers could reasonably disagree on
 
 **Recent turns.** The last few messages of the conversation a question arrived in, stored on the log row so an administrator reading an unanswered question can see what was being discussed. Not the whole conversation, which this system never stores.
 
-**Chunk.** A slice of one page's text, sized for embedding. Chunks carry the heading trail they were found under. Called a "piece" in the admin portal, because "chunk" means nothing to a non-technical reader.
+**Chunk.** A slice of one page's text, sized for embedding. Chunks carry the heading trail they were found under. "Chunk" is the word in code and in every technical document. The admin portal alone calls it a "piece", because "chunk" means nothing to a non-technical reader.
 
 **Corpus.** Every chunk of every published, included page. What a question is searched against.
 
 ## Working with the site
+
+**Frontier.** The set of addresses a fetch will actually download, decided before anything is downloaded. Every sitemap entry lands in exactly one bucket.
+
+**Bucket.** One of the lists in a fetch's report, each holding the addresses that met one fate: not an address, listed twice, disallowed by the robots list, excluded by a configured pattern, a stub by shape, excluded by the administrator, thin, unchanged, stored, or failed. The buckets add up to the number of entries the sitemap gave, so a page that vanished from the count is visible.
+
+**Stub.** An address that exists only to send a reader to another page. On this site a stub answers success with an instruction to go elsewhere rather than redirecting, and it has exactly one path segment where every real page has more.
+
+**Chrome.** The parts of a page that repeat on every page: navigation, header, footer, sidebar, and on this site a backlinks block and a graph view. Removed before a page's text is kept, because left in they land in every chunk and make unrelated pages score high for whatever they advertise.
+
+**Thin.** A downloaded page whose text, after the site's chrome is removed, falls under the configured word floor. Dropped and reported. A folder listing whose article arrives empty is the usual case.
 
 **Refresh.** A fetch that skips addresses whose content has not changed since the last time they were stored. The default.
 
@@ -60,7 +70,7 @@ Terms used across this repository where two readers could reasonably disagree on
 
 **Sentinel error.** A named failure that code returns instead of a message, so that a caller can test which failure happened rather than reading the words. Each one stands for a situation with its own remedy: a fetch already running, an address too long, a database refusing a caller to break a deadlock. Unrelated to the sentinel the model replies with, defined above; the two share a word because both are a fixed value standing for a known case.
 
-**Seam.** A point where a test can substitute the outside world. This system has two: where pages come from, and where results go.
+**Seam.** A point where a test can substitute the outside world. This system has three: where pages come from, where results go, and what turns a chunk's text into a vector. The third is a database call in production and a stand-in in tests.
 
 Each has one concrete implementation and no wide interface. Consumers declare the two to four methods they call, next to the code that calls them, and one test double satisfies all of those declarations. "The Store seam" therefore names a boundary, not a single type.
 

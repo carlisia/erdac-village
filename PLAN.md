@@ -40,7 +40,7 @@ Two rules govern every decision here.
 
 Everything Erdac does, subject to the pin rule. The full inventory is 11 HTTP routes, 5 tables, the candidate/published/superseded review workflow, the ingest pipeline with its canary gate and skip logic, the answering pipeline with its similarity cutoff and `[[NO_ANSWER]]` sentinel, the admin portal's eighteen affordances, and 214 tests.
 
-Structure is not mirrored. This is idiomatic Go, not a transliteration of the Python package layout. What is preserved from that layout is the pair of seams: where pages come from, and where results go. Those are what let a test run without touching the world (Q1). They are boundaries rather than types -- each has one concrete implementation, and consumers declare the handful of methods they call.
+Structure is not mirrored. This is idiomatic Go, not a transliteration of the Python package layout. What is preserved from that layout is the seams: where pages come from, where results go, and, added by this port because embedding moved into the database, what turns a chunk's text into a vector. Those are what let a test run without touching the world (Q1). They are boundaries rather than types -- each has one concrete implementation, and consumers declare the handful of methods they call.
 
 ## What is deliberately not built
 
@@ -106,7 +106,7 @@ The survey exists because the defences against those hazards are numbers in `sit
 
 To run it: fetch the robots file, fetch the sitemap, then fetch a sample of pages spread across the address shapes the sitemap contains. Nothing is written to the database. Re-run it whenever the site changes shape, and before any publish that follows such a change.
 
-Last run 2026-09-08 against a sample of roughly twenty pages. Findings are in italics.
+Last run 2026-09-08 against a sample of roughly twenty pages. Findings are in italics. The first full fetch, the same day, matched the survey's proportions for stubs, robots exclusions, thin pages and malformed entries.
 
 ### The checklist
 

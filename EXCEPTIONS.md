@@ -34,14 +34,6 @@ Shortcuts taken because this is a demonstration. Each entry says what was done, 
 
 **What production requires instead.** An index. At corpus sizes beyond a few thousand chunks a sequential scan per question stops being viable.
 
-## The fetch lock is advisory
-
-**What we did.** A marker in the database stops a second fetch starting while one is running, and stops a publish promoting a half-written set of pages. Nothing in the database enforces it. The three operations that write pages do not check it, so the guarantee holds only because the code that fetches takes the marker first.
-
-**Why acceptable here.** One person runs one fetch at a time, through one path, and that path takes the marker. The documentation on the marker says plainly that it is advisory and that anything writing pages must take it.
-
-**What production requires instead.** The check moved into the writes themselves, so that a page written without the marker is refused by the database rather than by a convention, or a lease the database validates on every write.
-
 ## Single tenant, one site, one admin
 
 **What we did.** One configuration file describes one website, and one shared password gates the admin portal.

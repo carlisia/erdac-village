@@ -12,7 +12,7 @@ Work that is postponed rather than rejected. Each entry says what it is, why it 
 
 ## Honouring robots.txt during the crawl
 
-**What.** The crawler reads the sitemap and downloads what it finds. It does not fetch or obey `robots.txt`, and it applies no crawl delay or rate limiting.
+**What.** The crawler reads the sitemap and downloads what it finds. It skips addresses matching a configured list that mirrors what `robots.txt` disallows, but it does not fetch or obey that file itself, and it applies no crawl delay or rate limiting.
 
 **Why it matters.** The target site's `robots.txt` disallows a path group that its own sitemap lists, so sitemap membership and permission disagree today, and following the sitemap alone fetches pages the site asked crawlers not to take. The survey of 2026-09-08 confirmed the overlap is about a fifth of the sitemap. That file also states usage terms in comments: it asks for attribution by name and forbids reproducing more than a hundred words verbatim. Comments are not directives, so no parser will enforce either one.
 
@@ -66,14 +66,6 @@ Work that is postponed rather than rejected. Each entry says what it is, why it 
 
 **What unblocks it.** One full crawl of the site, timed. The expiry should then be set well above the longest run observed, not close to it.
 
-## A stand-in database for the code that will use the store
-
-**What.** The store is the single piece of code that talks to the database. Anything else that needs to read or write data will go through it. The tests are split in two: a fast set that runs anywhere with no database at all, and a slow set that needs a real server running. For the fast set to cover the code that uses the store, that code needs something to talk to instead of the store: a stand-in that keeps its data in memory and behaves the same way. It is not written yet, because nothing uses the store yet. The parts that will -- the code that fetches pages, and the pages an administrator reviews them on -- are specified separately and come later.
-
-**Why it matters.** Without the stand-in, none of that code can be tested without a running database, so it either goes untested or its tests only run on a machine that has one set up by hand. Keep the fast set runnable with no setup at all, because a test that needs a machine prepared by hand is one that gets skipped.
-
-**What unblocks it.** The first piece of code that uses the store. Write the stand-in beside it, and make it cover what every later user of the store needs rather than only the first one.
-
 ## One shared setup for the tests that need a real database
 
 **What.** Two groups of tests need a real database server. Each one creates a temporary database, builds the tables inside it, runs, and deletes the database afterwards. That setup is written out twice, once in each group, because the two build the tables by different routes: one runs the file of table definitions directly, the other runs the program that applies them.
@@ -96,7 +88,7 @@ Work that is postponed rather than rejected. Each entry says what it is, why it 
 
 **Why it matters.** If the real number is different, the check stops recognising the case and the error passes through unchanged. That is the safe direction to be wrong in, because nothing is misreported, but the helpful message never appears and the operator sees a raw failure instead.
 
-**What unblocks it.** A server with the extension uninstalled, and one call to that function against it. Record the number observed and promote the note in the code from unmeasured to measured.
+**What unblocks it.** A server with the extension uninstalled, and one call to that function against it. Partly closed on 2026-09-08: calling a function that does not exist, with the extension present, returned error 1305 naming the function, which is the number the check narrows on. What remains unobserved is only that an uninstalled extension produces the same number for its own function, which is the same server code path and is now inference from one step away rather than from the manual.
 
 ## Discarding the candidate set left by a fetch that crashed
 
@@ -106,14 +98,11 @@ Work that is postponed rather than rejected. Each entry says what it is, why it 
 
 **What unblocks it.** The administration pages, which are specified separately. Add one action there that deletes the pending pages and clears the marker in a single step, and make it say how many pages it is discarding before it does so.
 
-## Making the fetch marker actually prevent two overlapping crawls
 
-**What.** A marker in the database is meant to stop two crawls running at once and mixing their pages into one set awaiting review. It does not currently do that, in three ways that have to be fixed together.
+## Re-applying the MCP server's settings after a restart
 
-The marker is treated as abandoned after a fixed age and nothing refreshes it, so a crawl that takes longer than that age has its marker taken by the next crawl to start. Nothing stops the first crawl carrying on: the three operations that write pages never look at the marker. And once a second crawl takes the marker over and finishes normally, nothing records that this happened, so publishing sees a healthy state and puts a mixture of two crawls in front of visitors.
+**What.** The settings that make the database reachable through MCP, such as which schema is exposed, the account it queries as, and the token it requires, are set with `SET GLOBAL` statements while the server runs. The bundled control script starts the server with no configuration file, so none of them survive a restart. After one, the MCP server is off and its settings are back to defaults.
 
-**Why it matters.** The result is a knowledge base assembled from two passes over the site, taken at different moments, with no report that anything went wrong. It is the exact failure the marker exists to prevent, and the only symptom is answers drawn from pages that were never live together.
+**Why it matters.** The first sign is a client that cannot connect, with nothing saying why. Someone has to remember that five statements need running again and what their values were, and the values include a secret.
 
-**What unblocks it.** A decision that cannot be made yet: what should happen to the pages the interrupted crawl already wrote. Discarding them is the only thing that guarantees a clean set, and it destroys pages an administrator may be part-way through reviewing. Keeping them means publishing has to stay refused until a crawl has demonstrably replaced every one, and whether a crawl has done that depends on which pages it chose to skip as unchanged.
-
-That skip rule is defined by the work on fetching, which is specified separately. Settle it there, then fix all three parts in one change: refresh the marker while a crawl runs, refuse a page write from a crawl that no longer holds it, and record a takeover so publishing refuses until the set is known to be clean.
+**What unblocks it.** Either a start-up hook that re-applies them from the credentials file, or a configuration file passed to the server at start, which the bundled script does not do today. The same gap already exists for the preview-extensions flag; see the architecture constraints.
